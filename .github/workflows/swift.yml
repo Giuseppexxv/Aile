@@ -11,10 +11,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Crea i file del progetto
+      - name: Installa XcodeGen
+        run: brew install xcodegen
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Versione Xcode
+        run: xcodebuild -version
+
+      - name: Crea tutti i file del progetto
         run: |
           mkdir -p App Support
-          cat > project.yml <<'EOF_FILE_0'
+          cat > project.yml << 'SWIFTEOF'
           name: AgenteLocale
           options:
             bundleIdPrefix: com.giuseppe
@@ -52,54 +61,81 @@ jobs:
                   MARKETING_VERSION: "1.0"
                   CURRENT_PROJECT_VERSION: "1"
                   TARGETED_DEVICE_FAMILY: "1"
-          EOF_FILE_0
-          cat > App/AgentViewModel.swift <<'EOF_FILE_1'
+          SWIFTEOF
+          cat > App/AgentViewModel.swift << 'SWIFTEOF'
           import SwiftUI
+          import UIKit
           import MLXLLM
           import MLXLMCommon
-
-          struct ChatItem: Identifiable {
-              enum Role { case user, assistant, tool }
-              let id = UUID()
-              let role: Role
-              var text: String
-              var toolName: String? = nil
-              var ok: Bool = true
-          }
 
           @MainActor
           final class AgentViewModel: ObservableObject {
               @Published var items: [ChatItem] = []
               @Published var currentModelID: String?
-              @Published var status = "Nessun modello caricato"
+              @Published var loadError: String?
               @Published var downloadProgress = 0.0
               @Published var isLoading = false
               @Published var isReady = false
               @Published var isGenerating = false
+              @Published var activity: String?
+              @Published var pending: PendingQuestion?
+              @Published var attachments: [String] = []
+
+              let store = Store()
 
               private var container: ModelContainer?
               private var session: ChatSession?
               private var task: Task<Void, Never>?
-              private let maxSteps = 10
+              private var continuation: CheckedContinuation<String, Never>?
+              private var threadID = UUID()
+              private var needsRecap = false
+              private var runToken = UUID()
+              private var lastHTML: String?
 
-              var shortModelName: String {
-                  currentModelID?.split(separator: "/").last.map(String.init) ?? "nessun modello"
+              init() {
+                  Workspace.root = store.currentFolder
               }
 
-              private func makeSession(_ c: ModelContainer) -> ChatSession {
-                  ChatSession(c, instructions: ToolParser.systemPrompt)
+              // MARK: Impostazioni lette al volo
+
+              private var maxSteps: Int {
+                  let v = UserDefaults.standard.integer(forKey: "maxSteps")
+                  return v == 0 ? 12 : v
+              }
+              private var confirmDelete: Bool {
+                  UserDefaults.standard.object(forKey: "confirmDelete") as? Bool ?? true
+              }
+              private var webOn: Bool { UserDefaults.standard.bool(forKey: "addon.web") }
+              private var clipboardOn: Bool { UserDefaults.standard.bool(forKey: "addon.clipboard") }
+
+              var shortModelName: String {
+                  currentModelID?.split(separator: "/").last.map(String.init) ?? "Scegli un modello"
+              }
+
+              // MARK: Modello
+
+              private func makeSession() {
+                  guard let container else { session = nil; return }
+                  session = ChatSession(
+                      container,
+                      instructions: ToolParser.systemPrompt(web: webOn, clipboard: clipboardOn))
+              }
+
+              func addonsChanged() {
+                  makeSession()
+                  needsRecap = !items.isEmpty
               }
 
               func loadModel(_ id: String) async {
-                  guard !isLoading, !isGenerating else { return }
+                  guard !isLoading else { return }
+                  stop()
                   isLoading = true
                   isReady = false
+                  loadError = nil
                   downloadProgress = 0
                   session = nil
                   container = nil
-                  items = []
                   currentModelID = id
-                  status = "Scarico \(shortModelName)…"
 
                   do {
                       let configuration = ModelConfiguration(id: id)
@@ -111,38 +147,218 @@ jobs:
                           }
                       }
                       container = loaded
-                      session = makeSession(loaded)
+                      makeSession()
+                      needsRecap = !items.isEmpty
                       isReady = true
-                      status = "Pronto · tutto in locale"
+                      UserDefaults.standard.set(id, forKey: "lastModel")
                   } catch {
-                      status = "Errore: \(error.localizedDescription)"
+                      loadError = error.localizedDescription
                   }
                   isLoading = false
               }
 
-              func send(_ text: String) {
-                  guard let session, !isGenerating else { return }
+              func loadLastModelIfNeeded() async {
+                  guard currentModelID == nil,
+                        let id = UserDefaults.standard.string(forKey: "lastModel") else { return }
+                  await loadModel(id)
+              }
+
+              // MARK: Chat e progetti
+
+              private func saveCurrent() {
+                  guard !items.isEmpty else { return }
+                  let first = items.first(where: { $0.role == .user })?.text ?? "Nuova chat"
+                  let title = String(first.prefix(40))
+                  store.save(ChatThread(id: threadID, title: title, projectID: store.currentProjectID, items: items))
+                  store.currentThreadID = threadID
+              }
+
+              private func resetChat() {
+                  threadID = UUID()
+                  items = []
+                  needsRecap = false
+                  lastHTML = nil
+                  attachments = []
+                  makeSession()
+              }
+
+              func newChat() {
+                  stop()
+                  resetChat()
+              }
+
+              func open(_ thread: ChatThread) {
+                  stop()
+                  if let p = store.projects.first(where: { $0.id == thread.projectID }) {
+                      store.selectProject(p)
+                      Workspace.root = store.currentFolder
+                  }
+                  threadID = thread.id
+                  items = thread.items
+                  needsRecap = !items.isEmpty
+                  attachments = []
+                  makeSession()
+              }
+
+              func selectProject(_ p: Project) {
+                  stop()
+                  store.selectProject(p)
+                  Workspace.root = store.currentFolder
+                  resetChat()
+              }
+
+              func createProject(_ name: String) {
+                  let p = store.createProject(name: name)
+                  selectProject(p)
+              }
+
+              func deleteProject(_ p: Project) {
+                  guard store.projects.count > 1 else { return }
+                  let wasCurrent = p.id == store.currentProjectID
+                  if wasCurrent { stop() }
+                  store.deleteProject(p)
+                  if wasCurrent {
+                      Workspace.root = store.currentFolder
+                      resetChat()
+                  }
+              }
+
+              func deleteChat(_ id: UUID) {
+                  if id == threadID { stop() }
+                  store.deleteThread(id)
+                  if id == threadID { resetChat() }
+              }
+
+              func clearAllChats() {
+                  stop()
+                  store.deleteAllThreads()
+                  resetChat()
+              }
+
+              // MARK: Allegati
+
+              private func uniqueName(_ base: String) -> String {
+                  let fm = FileManager.default
+                  let ext = (base as NSString).pathExtension
+                  let stem = (base as NSString).deletingPathExtension
+                  var name = base
+                  var n = 2
+                  while fm.fileExists(atPath: Workspace.root.appendingPathComponent(name).path) {
+                      name = ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)"
+                      n += 1
+                  }
+                  return name
+              }
+
+              func attachFiles(_ urls: [URL]) {
+                  for url in urls {
+                      let scoped = url.startAccessingSecurityScopedResource()
+                      defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                      let name = uniqueName(url.lastPathComponent)
+                      do {
+                          try FileManager.default.copyItem(at: url, to: Workspace.root.appendingPathComponent(name))
+                          attachments.append(name)
+                      } catch {
+                          loadError = "Non riesco ad allegare «\(url.lastPathComponent)»: \(error.localizedDescription)"
+                      }
+                  }
+              }
+
+              func attachPhoto(data: Data) {
+                  let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.9) ?? data
+                  let name = uniqueName("foto.jpg")
+                  do {
+                      try jpeg.write(to: Workspace.root.appendingPathComponent(name))
+                      attachments.append(name)
+                  } catch {
+                      loadError = "Non riesco ad allegare la foto: \(error.localizedDescription)"
+                  }
+              }
+
+              func removeAttachment(_ name: String) {
+                  attachments.removeAll { $0 == name }
+              }
+
+              // MARK: Domande all'utente
+
+              private func ask(_ q: PendingQuestion) async -> String {
+                  await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+                      continuation = cont
+                      pending = q
+                  }
+              }
+
+              func answer(_ text: String) {
+                  guard let cont = continuation else { return }
+                  continuation = nil
+                  pending = nil
                   items.append(ChatItem(role: .user, text: text))
+                  cont.resume(returning: text)
+              }
+
+              // MARK: Invio e ciclo dell'agente
+
+              private func recap() -> String {
+                  let lines = items.suffix(12).compactMap { item -> String? in
+                      switch item.role {
+                      case .user: return "User: " + String(item.text.prefix(400))
+                      case .assistant: return "Assistant: " + String(item.text.prefix(400))
+                      case .tool: return "Action done: " + item.text
+                      }
+                  }
+                  return "[Earlier conversation, for context only]\n" + lines.joined(separator: "\n")
+                      + "\n[End of earlier conversation]\n\n"
+              }
+
+              func send(_ text: String) {
+                  if pending != nil { answer(text); return }
+                  guard isReady, !isGenerating, let session else { return }
+
+                  let files = attachments
+                  attachments = []
+                  let recapText = needsRecap ? recap() : ""
+                  needsRecap = false
+
+                  items.append(ChatItem(role: .user, text: text, attachments: files))
+                  saveCurrent()
+
+                  var prompt = recapText + text
+                  if !files.isEmpty {
+                      prompt += "\n\n[The user attached these files, now in the project folder: "
+                          + files.joined(separator: ", ") + ". Use read_file to look at them.]"
+                  }
+
+                  lastHTML = nil
+                  runToken = UUID()
+                  let token = runToken
                   isGenerating = true
                   task = Task {
-                      await runAgent(session: session, firstPrompt: text)
-                      isGenerating = false
+                      await runAgent(session: session, firstPrompt: prompt)
+                      if token == runToken {
+                          activity = nil
+                          isGenerating = false
+                          saveCurrent()
+                      }
                   }
               }
 
               private func runAgent(session: ChatSession, firstPrompt: String) async {
                   var prompt = firstPrompt
-                  for _ in 0..<maxSteps {
+                  let limit = maxSteps
+                  for _ in 0..<limit {
                       if Task.isCancelled { return }
                       items.append(ChatItem(role: .assistant, text: ""))
                       let index = items.count - 1
                       var full = ""
+                      activity = "Sto pensando…"
                       do {
                           for try await chunk in session.streamResponse(to: prompt) {
+                              if Task.isCancelled { break }
                               full += chunk
                               items[index].text = ToolParser.visibleText(full)
-                              // appena il modello chiude una chiamata, ci fermiamo: il risultato lo diamo noi
-                              if full.contains("</tool_call>") { break }
+                              activity = ToolParser.activity(full)
+                              // appena il modello chiude un comando ci fermiamo: il risultato lo diamo noi
+                              if ToolParser.hasCompleteCall(full) { break }
                           }
                       } catch {
                           if !Task.isCancelled {
@@ -151,34 +367,129 @@ jobs:
                           return
                       }
                       if Task.isCancelled { return }
+                      activity = nil
 
                       let calls = ToolParser.parse(full)
-                      if items[index].text.isEmpty { items.remove(at: index) }
-                      if calls.isEmpty { return }
+                      let shown = items[index].text
+                      if shown.isEmpty { items.remove(at: index) }
+
+                      if calls.isEmpty {
+                          if ToolParser.hasUnclosedBlock(full) {
+                              items.append(ChatItem(role: .tool, text: "Il file era incompleto, riprovo", toolName: "retry", ok: false))
+                              prompt = "<tool_response>\n[error] Your file block was not closed with its closing tag, so nothing was saved. Write the complete file again, from the opening tag to the closing tag.\n</tool_response>"
+                              continue
+                          }
+                          if shown.isEmpty && lastHTML == nil {
+                              items.append(ChatItem(role: .assistant, text: "Non ho ricevuto nessuna risposta dal modello. Riprova, o prova un modello diverso."))
+                          }
+                          if let html = lastHTML {
+                              items.append(ChatItem(role: .tool, text: "Il tuo sito è pronto", toolName: "preview", previewPath: html))
+                          }
+                          return
+                      }
 
                       var results: [String] = []
                       for call in calls {
-                          let (ok, output) = Workspace.run(call)
-                          items.append(ChatItem(role: .tool, text: call.summary, toolName: call.name, ok: ok))
+                          activity = call.summary + "…"
+                          let (ok, output) = await execute(call)
+                          if Task.isCancelled { return }
+                          if call.name != "ask_user" {
+                              items.append(ChatItem(role: .tool, text: call.summary, toolName: call.name, ok: ok))
+                          }
+                          if ok, call.name == "write_file", let path = call.args["path"] as? String,
+                             path.lowercased().hasSuffix(".html") {
+                              lastHTML = path
+                          }
                           results.append("[\(call.name)] \(ok ? "ok" : "error"): \(output)")
                       }
+                      activity = nil
                       prompt = "<tool_response>\n" + results.joined(separator: "\n\n") + "\n</tool_response>"
                   }
-                  items.append(ChatItem(role: .assistant, text: "Mi fermo: ho raggiunto il limite di passaggi per un singolo ordine."))
+                  items.append(ChatItem(role: .assistant, text: "Mi fermo qui: ho raggiunto il limite di passaggi per un singolo ordine. Puoi aumentarlo da Impostazioni, oppure scrivimi «continua»."))
+                  if let html = lastHTML {
+                      items.append(ChatItem(role: .tool, text: "Anteprima del sito", toolName: "preview", previewPath: html))
+                  }
+              }
+
+              private func execute(_ call: ToolCall) async -> (Bool, String) {
+                  switch call.name {
+                  case "ask_user":
+                      let q = (call.args["question"] as? String) ?? "Come vuoi procedere?"
+                      let options = (call.args["options"] as? [Any])?.compactMap { $0 as? String } ?? []
+                      items.append(ChatItem(role: .assistant, text: q))
+                      let a = await ask(PendingQuestion(question: q, options: options))
+                      return (true, "The user answered: \(a)")
+
+                  case "delete_file":
+                      if confirmDelete {
+                          let path = (call.args["path"] as? String) ?? "questo file"
+                          let q = "Posso eliminare «\(path)»?"
+                          items.append(ChatItem(role: .assistant, text: q))
+                          let a = await ask(PendingQuestion(question: q, options: ["Sì, elimina", "No"]))
+                          if !a.lowercased().hasPrefix("s") {
+                              return (false, "The user said no. Do not delete it.")
+                          }
+                      }
+                      return Workspace.run(call)
+
+                  case "fetch_url":
+                      guard webOn else { return (false, "This tool is not available.") }
+                      return await fetchURL((call.args["url"] as? String) ?? "")
+
+                  case "copy_to_clipboard":
+                      guard clipboardOn else { return (false, "This tool is not available.") }
+                      UIPasteboard.general.string = (call.args["text"] as? String) ?? ""
+                      return (true, "copied to the clipboard")
+
+                  default:
+                      return Workspace.run(call)
+                  }
+              }
+
+              private func fetchURL(_ s: String) async -> (Bool, String) {
+                  guard let url = URL(string: s), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+                      return (false, "invalid URL")
+                  }
+                  do {
+                      var req = URLRequest(url: url, timeoutInterval: 20)
+                      req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+                      let (data, _) = try await URLSession.shared.data(for: req)
+                      var text = String(decoding: data, as: UTF8.self)
+                      for pattern in [#"<script[\s\S]*?</script>"#, #"<style[\s\S]*?</style>"#, #"<[^>]+>"#] {
+                          if let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                              text = re.stringByReplacingMatches(
+                                  in: text, range: NSRange(location: 0, length: (text as NSString).length),
+                                  withTemplate: " ")
+                          }
+                      }
+                      if let re = try? NSRegularExpression(pattern: #"\s+"#) {
+                          text = re.stringByReplacingMatches(
+                              in: text, range: NSRange(location: 0, length: (text as NSString).length),
+                              withTemplate: " ")
+                      }
+                      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                      return (true, String(trimmed.prefix(6000)))
+                  } catch {
+                      return (false, error.localizedDescription)
+                  }
               }
 
               func stop() {
+                  runToken = UUID()
                   task?.cancel()
-              }
-
-              func reset() {
-                  stop()
-                  items = []
-                  if let container { session = makeSession(container) }
+                  task = nil
+                  if let cont = continuation {
+                      continuation = nil
+                      cont.resume(returning: "(annullato)")
+                  }
+                  pending = nil
+                  activity = nil
+                  isGenerating = false
+                  saveCurrent()
               }
           }
-          EOF_FILE_1
-          cat > App/AgenteLocaleApp.swift <<'EOF_FILE_2'
+          SWIFTEOF
+          cat > App/AgenteLocaleApp.swift << 'SWIFTEOF'
           import SwiftUI
 
           @main
@@ -190,19 +501,55 @@ jobs:
                   }
               }
           }
-          EOF_FILE_2
-          cat > App/ContentView.swift <<'EOF_FILE_3'
+          SWIFTEOF
+          cat > App/ContentView.swift << 'SWIFTEOF'
           import SwiftUI
+          import PhotosUI
+          import UniformTypeIdentifiers
+
+          enum ActiveSheet: Identifiable {
+              case models, files, projects, addons, settings
+              case preview(PreviewTarget)
+
+              var id: String {
+                  switch self {
+                  case .models: return "models"
+                  case .files: return "files"
+                  case .projects: return "projects"
+                  case .addons: return "addons"
+                  case .settings: return "settings"
+                  case .preview(let t): return "preview-" + t.id
+                  }
+              }
+          }
 
           struct ContentView: View {
               @StateObject private var agent = AgentViewModel()
               @StateObject private var library = ModelLibrary()
+
               @State private var input = ""
-              @State private var showModels = false
-              @State private var showFiles = false
+              @State private var showMenu = false
+              @State private var sheet: ActiveSheet?
+              @State private var heavyModel: String?
+              @State private var showHeavyAlert = false
+              @State private var showFileImporter = false
+              @State private var showPhotoPicker = false
+              @State private var photoItem: PhotosPickerItem?
+
+              private let examples = [
+                  "Fai un sito per la mia pizzeria",
+                  "Scrivi una lista della spesa per la settimana",
+                  "Leggi il PDF che ti allego e riassumilo"
+              ]
+
+              private var trimmedInput: String {
+                  input.trimmingCharacters(in: .whitespacesAndNewlines)
+              }
 
               private var canSend: Bool {
-                  agent.isReady && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  let hasContent = !trimmedInput.isEmpty || !agent.attachments.isEmpty
+                  if agent.pending != nil { return !trimmedInput.isEmpty }
+                  return hasContent && agent.isReady && !agent.isGenerating
               }
 
               var body: some View {
@@ -211,28 +558,144 @@ jobs:
                           Backdrop()
                           chat
                       }
-                      .navigationTitle("Agente")
                       .navigationBarTitleDisplayMode(.inline)
                       .toolbar {
                           ToolbarItem(placement: .topBarLeading) {
-                              Button { showFiles = true } label: { Image(systemName: "folder") }
+                              Button { showMenu = true } label: { Image(systemName: "line.3.horizontal") }
                           }
-                          ToolbarItem(placement: .topBarTrailing) {
-                              Button { showModels = true } label: { Image(systemName: "cpu") }
-                          }
-                          ToolbarItem(placement: .topBarTrailing) {
-                              Button { agent.reset() } label: { Image(systemName: "arrow.counterclockwise") }
-                                  .disabled(agent.items.isEmpty || agent.isLoading)
-                          }
+                          ToolbarItem(placement: .principal) { modelMenu }
                       }
                       .safeAreaInset(edge: .bottom) { inputBar }
-                      .sheet(isPresented: $showModels) {
-                          ModelsView(library: library, agent: agent)
-                      }
-                      .sheet(isPresented: $showFiles) {
-                          FilesView()
+                  }
+                  .overlay { drawer }
+                  .sheet(item: $sheet) { s in
+                      switch s {
+                      case .models: ModelsView(library: library, agent: agent, onChoose: choose)
+                      case .files: FilesView(store: agent.store)
+                      case .projects: ProjectsView(agent: agent, store: agent.store)
+                      case .addons: AddonsView(agent: agent)
+                      case .settings: SettingsView(agent: agent)
+                      case .preview(let target): PreviewSheet(target: target)
                       }
                   }
+                  .alert("Modello pesante", isPresented: $showHeavyAlert, presenting: heavyModel) { id in
+                      Button("Prova lo stesso") { Task { await agent.loadModel(id) } }
+                      Button("Annulla", role: .cancel) {}
+                  } message: { id in
+                      Text(ModelInfo.warning(id))
+                  }
+                  .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+                      if case .success(let urls) = result { agent.attachFiles(urls) }
+                  }
+                  .photosPicker(isPresented: $showPhotoPicker, selection: $photoItem, matching: .images)
+                  .onChange(of: photoItem) { _, item in
+                      guard let item else { return }
+                      Task {
+                          if let data = try? await item.loadTransferable(type: Data.self) {
+                              agent.attachPhoto(data: data)
+                          }
+                          photoItem = nil
+                      }
+                  }
+                  .task { await agent.loadLastModelIfNeeded() }
+              }
+
+              // MARK: Scelta del modello
+
+              private func choose(_ id: String) {
+                  guard !agent.isLoading else { return }
+                  if id == agent.currentModelID && agent.isReady { return }
+                  let present = {
+                      switch ModelInfo.weight(id) {
+                      case .heavy, .tooHeavy:
+                          heavyModel = id
+                          showHeavyAlert = true
+                      default:
+                          Task { await agent.loadModel(id) }
+                      }
+                  }
+                  if sheet != nil {
+                      sheet = nil
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { present() }
+                  } else {
+                      present()
+                  }
+              }
+
+              private func menuTitle(_ id: String) -> String {
+                  let name = id.split(separator: "/").last.map(String.init) ?? id
+                  var title = name
+                  let size = ModelInfo.sizeLabel(id)
+                  if !size.isEmpty { title += " · " + size }
+                  switch ModelInfo.weight(id) {
+                  case .heavy, .tooHeavy: title += " ⚠︎"
+                  default: break
+                  }
+                  return title
+              }
+
+              private var titleText: String {
+                  if agent.isLoading { return "Scarico… \(Int(agent.downloadProgress * 100))%" }
+                  return agent.shortModelName
+              }
+
+              private var modelMenu: some View {
+                  Menu {
+                      Section("I tuoi modelli") {
+                          ForEach(library.saved, id: \.self) { id in
+                              Button { choose(id) } label: {
+                                  if id == agent.currentModelID {
+                                      Label(menuTitle(id), systemImage: "checkmark")
+                                  } else {
+                                      Text(menuTitle(id))
+                                  }
+                              }
+                          }
+                      }
+                      Divider()
+                      Button { sheet = .models } label: {
+                          Label("Scarica altri modelli…", systemImage: "arrow.down.circle")
+                      }
+                  } label: {
+                      HStack(spacing: 4) {
+                          Text(titleText).font(.headline).lineLimit(1)
+                          Image(systemName: "chevron.down").font(.caption.weight(.bold))
+                      }
+                  }
+              }
+
+              // MARK: Menu laterale
+
+              private var drawer: some View {
+                  ZStack(alignment: .leading) {
+                      if showMenu {
+                          Color.black.opacity(0.35)
+                              .ignoresSafeArea()
+                              .onTapGesture { showMenu = false }
+                              .transition(.opacity)
+                          SideMenu(
+                              store: agent.store,
+                              onNewChat: { agent.newChat(); showMenu = false },
+                              onOpen: { thread in agent.open(thread); showMenu = false },
+                              onDelete: { id in agent.deleteChat(id) },
+                              onSheet: { target in
+                                  showMenu = false
+                                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { sheet = target }
+                              }
+                          )
+                          .frame(width: 310)
+                          .frame(maxHeight: .infinity)
+                          .glass(cornerRadius: 30)
+                          .padding(8)
+                          .transition(.move(edge: .leading))
+                          .gesture(
+                              DragGesture().onEnded { value in
+                                  if value.translation.width < -60 { showMenu = false }
+                              }
+                          )
+                      }
+                  }
+                  .animation(.easeInOut(duration: 0.25), value: showMenu)
               }
 
               // MARK: Chat
@@ -241,7 +704,8 @@ jobs:
                   ScrollViewReader { proxy in
                       ScrollView {
                           VStack(spacing: 12) {
-                              statusChip
+                              if agent.isLoading { loadingChip }
+                              if let err = agent.loadError { errorChip(err) }
                               if agent.items.isEmpty {
                                   emptyState
                               } else {
@@ -249,56 +713,95 @@ jobs:
                                       row(item).id(item.id)
                                   }
                               }
+                              if let q = agent.pending, !q.options.isEmpty { optionsView(q) }
+                              if let activity = agent.activity { activityChip(activity) }
+                              Color.clear.frame(height: 1).id("bottom")
                           }
                           .padding()
                       }
-                      .onChange(of: agent.items.last?.text) { _, _ in
-                          if let last = agent.items.last {
-                              proxy.scrollTo(last.id, anchor: .bottom)
-                          }
-                      }
-                      .onChange(of: agent.items.count) { _, _ in
-                          if let last = agent.items.last {
-                              proxy.scrollTo(last.id, anchor: .bottom)
-                          }
-                      }
+                      .scrollDismissesKeyboard(.interactively)
+                      .onChange(of: agent.items.count) { _, _ in scrollToBottom(proxy) }
+                      .onChange(of: agent.items.last?.text) { _, _ in scrollToBottom(proxy) }
+                      .onChange(of: agent.activity) { _, _ in scrollToBottom(proxy) }
+                      .onChange(of: agent.pending?.id) { _, _ in scrollToBottom(proxy) }
                   }
               }
 
-              private var statusChip: some View {
+              private func scrollToBottom(_ proxy: ScrollViewProxy) {
+                  proxy.scrollTo("bottom", anchor: .bottom)
+              }
+
+              private var loadingChip: some View {
                   VStack(spacing: 6) {
-                      HStack(spacing: 8) {
-                          Image(systemName: agent.isReady ? "checkmark.circle.fill" : "cpu")
-                              .foregroundStyle(agent.isReady ? .green : .secondary)
-                          Text(agent.shortModelName).font(.subheadline.weight(.semibold))
-                          Text("·").foregroundStyle(.secondary)
-                          Text(agent.status).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
-                      }
-                      if agent.isLoading {
-                          ProgressView(value: agent.downloadProgress)
-                      }
+                      Text("Preparo \(agent.shortModelName)…").font(.subheadline.weight(.semibold))
+                      ProgressView(value: agent.downloadProgress)
+                      Text("La prima volta il modello va scaricato: serve il Wi-Fi.")
+                          .font(.footnote).foregroundStyle(.secondary)
                   }
-                  .padding(.horizontal, 14)
-                  .padding(.vertical, 10)
+                  .padding(14)
                   .glass(cornerRadius: 18)
               }
 
+              private func errorChip(_ message: String) -> some View {
+                  HStack(alignment: .top, spacing: 8) {
+                      Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                      Text(message).font(.footnote)
+                      Spacer(minLength: 0)
+                  }
+                  .padding(12)
+                  .glass(cornerRadius: 16, tint: .orange)
+              }
+
+              private func activityChip(_ text: String) -> some View {
+                  HStack(spacing: 10) {
+                      ProgressView()
+                      Text(text).font(.footnote).lineLimit(2)
+                      Spacer(minLength: 0)
+                  }
+                  .padding(.horizontal, 14).padding(.vertical, 10)
+                  .glass(cornerRadius: 18)
+              }
+
+              private func optionsView(_ q: PendingQuestion) -> some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      ForEach(q.options, id: \.self) { option in
+                          Button { agent.answer(option) } label: {
+                              Text(option).frame(maxWidth: .infinity)
+                          }
+                          .modifier(GlassButton())
+                      }
+                      Text("…oppure scrivi la tua risposta qui sotto.")
+                          .font(.footnote).foregroundStyle(.secondary)
+                  }
+              }
+
               private var emptyState: some View {
-                  VStack(spacing: 14) {
+                  VStack(spacing: 16) {
                       Image(systemName: "sparkles")
                           .font(.system(size: 44))
                           .foregroundStyle(.white.opacity(0.9))
-                      Text("Il tuo agente, sul tuo iPhone")
+                      Text("Cosa vuoi creare oggi?")
                           .font(.title3.weight(.semibold))
-                      Text(agent.isReady
-                           ? "Dagli un ordine, per esempio: «Crea un file todo.txt con tre cose da fare»."
-                           : "Scegli un modello da Hugging Face e caricalo per cominciare.")
-                          .font(.subheadline)
-                          .foregroundStyle(.secondary)
-                          .multilineTextAlignment(.center)
-                      if !agent.isReady {
-                          Button { showModels = true } label: {
-                              Label("Scegli un modello", systemImage: "cpu")
+                      if agent.isReady {
+                          Text("Dimmi cosa ti serve: faccio tutto io e ti chiedo qualcosa solo se serve davvero.")
+                              .font(.subheadline)
+                              .foregroundStyle(.secondary)
+                              .multilineTextAlignment(.center)
+                          VStack(spacing: 8) {
+                              ForEach(examples, id: \.self) { example in
+                                  Button { input = example } label: {
+                                      Text(example).font(.subheadline).frame(maxWidth: .infinity)
+                                  }
+                                  .modifier(GlassButton())
+                              }
+                          }
+                      } else if !agent.isLoading {
+                          Text("Per cominciare scegli un modello dal menu in alto: tocca il nome al centro.")
+                              .font(.subheadline)
+                              .foregroundStyle(.secondary)
+                              .multilineTextAlignment(.center)
+                          Button { sheet = .models } label: {
+                              Label("Scegli o scarica un modello", systemImage: "arrow.down.circle")
                                   .padding(.horizontal, 8)
                           }
                           .modifier(GlassButton(prominent: true))
@@ -306,7 +809,7 @@ jobs:
                   }
                   .padding(24)
                   .frame(maxWidth: .infinity)
-                  .padding(.top, 40)
+                  .padding(.top, 30)
               }
 
               @ViewBuilder
@@ -315,10 +818,14 @@ jobs:
                   case .user:
                       HStack {
                           Spacer(minLength: 48)
-                          Text(item.text)
-                              .textSelection(.enabled)
-                              .padding(.horizontal, 14).padding(.vertical, 10)
-                              .glass(cornerRadius: 20, tint: .blue)
+                          VStack(alignment: .trailing, spacing: 4) {
+                              ForEach(item.attachments, id: \.self) { name in
+                                  Label(name, systemImage: "paperclip").font(.caption)
+                              }
+                              Text(item.text).textSelection(.enabled)
+                          }
+                          .padding(.horizontal, 14).padding(.vertical, 10)
+                          .glass(cornerRadius: 20, tint: .blue)
                       }
                   case .assistant:
                       HStack {
@@ -329,17 +836,37 @@ jobs:
                           Spacer(minLength: 48)
                       }
                   case .tool:
+                      toolRow(item)
+                  }
+              }
+
+              @ViewBuilder
+              private func toolRow(_ item: ChatItem) -> some View {
+                  if let path = item.previewPath {
+                      Button { openPreview(path) } label: {
+                          Label("Apri il sito  ·  \(path)", systemImage: "safari")
+                              .frame(maxWidth: .infinity)
+                      }
+                      .modifier(GlassButton(prominent: true))
+                  } else {
                       HStack(spacing: 8) {
-                          Image(systemName: item.ok ? "doc.badge.gearshape" : "exclamationmark.triangle.fill")
+                          Image(systemName: item.ok ? icon(for: item.toolName) : "exclamationmark.triangle.fill")
                               .foregroundStyle(item.ok ? Color.teal : Color.orange)
-                          Text(item.text)
-                              .font(.system(.footnote, design: .monospaced))
-                              .lineLimit(2)
+                          Text(item.text).font(.footnote).lineLimit(2)
                           Spacer(minLength: 0)
                       }
                       .padding(.horizontal, 12).padding(.vertical, 8)
                       .glass(cornerRadius: 14, tint: item.ok ? .teal : .orange)
                   }
+              }
+
+              private func icon(for tool: String?) -> String {
+                  ToolCall(name: tool ?? "", args: [:]).icon
+              }
+
+              private func openPreview(_ path: String) {
+                  let url = Workspace.root.appendingPathComponent(path)
+                  sheet = .preview(PreviewTarget(url: url, root: Workspace.root))
               }
 
               private func markdown(_ s: String) -> AttributedString {
@@ -348,44 +875,81 @@ jobs:
                   return (try? AttributedString(markdown: s, options: options)) ?? AttributedString(s)
               }
 
-              // MARK: Input
+              // MARK: Barra di scrittura
 
               private var inputBar: some View {
-                  HStack(alignment: .bottom, spacing: 10) {
-                      TextField("Dai un ordine all'agente…", text: $input, axis: .vertical)
-                          .lineLimit(1...5)
-                          .padding(.horizontal, 16).padding(.vertical, 12)
-                          .glass(cornerRadius: 24, interactive: true)
-
-                      if agent.isGenerating {
-                          Button { agent.stop() } label: {
-                              Image(systemName: "stop.fill").frame(width: 28, height: 28)
+                  VStack(spacing: 8) {
+                      if !agent.attachments.isEmpty {
+                          ScrollView(.horizontal, showsIndicators: false) {
+                              HStack(spacing: 8) {
+                                  ForEach(agent.attachments, id: \.self) { name in
+                                      HStack(spacing: 6) {
+                                          Image(systemName: "paperclip")
+                                          Text(name).lineLimit(1)
+                                          Button { agent.removeAttachment(name) } label: {
+                                              Image(systemName: "xmark.circle.fill")
+                                          }
+                                          .buttonStyle(.plain)
+                                      }
+                                      .font(.footnote)
+                                      .padding(.horizontal, 10).padding(.vertical, 6)
+                                      .glass(cornerRadius: 14)
+                                  }
+                              }
                           }
-                          .modifier(GlassButton(prominent: true))
-                          .buttonBorderShape(.circle)
-                      } else {
-                          Button {
-                              let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-                              guard !text.isEmpty else { return }
-                              input = ""
-                              agent.send(text)
+                      }
+                      HStack(alignment: .bottom, spacing: 10) {
+                          Menu {
+                              Button { showFileImporter = true } label: { Label("File", systemImage: "doc") }
+                              Button { showPhotoPicker = true } label: { Label("Foto", systemImage: "photo") }
                           } label: {
-                              Image(systemName: "arrow.up").frame(width: 28, height: 28)
+                              Image(systemName: "plus").frame(width: 28, height: 28)
                           }
-                          .modifier(GlassButton(prominent: true))
+                          .modifier(GlassButton())
                           .buttonBorderShape(.circle)
-                          .disabled(!canSend)
+
+                          TextField(placeholder, text: $input, axis: .vertical)
+                              .lineLimit(1...5)
+                              .padding(.horizontal, 16).padding(.vertical, 12)
+                              .glass(cornerRadius: 24, interactive: true)
+
+                          if agent.isGenerating && agent.pending == nil {
+                              Button { agent.stop() } label: {
+                                  Image(systemName: "stop.fill").frame(width: 28, height: 28)
+                              }
+                              .modifier(GlassButton(prominent: true))
+                              .buttonBorderShape(.circle)
+                          } else {
+                              Button { sendTapped() } label: {
+                                  Image(systemName: "arrow.up").frame(width: 28, height: 28)
+                              }
+                              .modifier(GlassButton(prominent: true))
+                              .buttonBorderShape(.circle)
+                              .disabled(!canSend)
+                          }
                       }
                   }
                   .padding(.horizontal)
                   .padding(.vertical, 8)
               }
+
+              private var placeholder: String {
+                  if agent.pending != nil { return "Scrivi la tua risposta…" }
+                  return agent.isReady ? "Dimmi cosa vuoi fare…" : "Prima scegli un modello…"
+              }
+
+              private func sendTapped() {
+                  let text = trimmedInput.isEmpty ? "Guarda i file che ti ho allegato." : trimmedInput
+                  input = ""
+                  agent.send(text)
+              }
           }
-          EOF_FILE_3
-          cat > App/FilesView.swift <<'EOF_FILE_4'
+          SWIFTEOF
+          cat > App/FilesView.swift << 'SWIFTEOF'
           import SwiftUI
 
           struct FilesView: View {
+              @ObservedObject var store: Store
               @Environment(\.dismiss) private var dismiss
               @State private var files: [URL] = []
 
@@ -394,9 +958,9 @@ jobs:
                       Group {
                           if files.isEmpty {
                               ContentUnavailableView(
-                                  "Workspace vuoto",
+                                  "Il progetto è vuoto",
                                   systemImage: "folder",
-                                  description: Text("I file creati dall'agente compaiono qui e nell'app File, sotto Su iPhone > Agente Locale.")
+                                  description: Text("I file creati dall'agente compaiono qui e nell'app File, sotto Su iPhone > Agente Locale > Progetti.")
                               )
                           } else {
                               List {
@@ -412,7 +976,7 @@ jobs:
                               }
                           }
                       }
-                      .navigationTitle("Workspace")
+                      .navigationTitle(store.currentProject.name)
                       .navigationBarTitleDisplayMode(.inline)
                       .toolbar {
                           ToolbarItem(placement: .confirmationAction) {
@@ -427,6 +991,11 @@ jobs:
           struct FileViewer: View {
               let url: URL
               @State private var text = ""
+              @State private var preview: PreviewTarget?
+
+              private var isHTML: Bool {
+                  ["html", "htm"].contains(url.pathExtension.lowercased())
+              }
 
               var body: some View {
                   ScrollView {
@@ -439,17 +1008,29 @@ jobs:
                   .navigationTitle(url.lastPathComponent)
                   .navigationBarTitleDisplayMode(.inline)
                   .toolbar {
+                      if isHTML {
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button {
+                                  preview = PreviewTarget(url: url, root: Workspace.root)
+                              } label: {
+                                  Image(systemName: "safari")
+                              }
+                          }
+                      }
                       ToolbarItem(placement: .topBarTrailing) {
                           ShareLink(item: url)
                       }
                   }
+                  .sheet(item: $preview) { target in
+                      PreviewSheet(target: target)
+                  }
                   .onAppear {
-                      text = (try? String(contentsOf: url, encoding: .utf8)) ?? "(file non leggibile come testo)"
+                      text = (try? Workspace.readText(url)) ?? "(file non leggibile come testo)"
                   }
               }
           }
-          EOF_FILE_4
-          cat > App/Glass.swift <<'EOF_FILE_5'
+          SWIFTEOF
+          cat > App/Glass.swift << 'SWIFTEOF'
           import SwiftUI
 
           @available(iOS 26.0, *)
@@ -523,8 +1104,8 @@ jobs:
                   .ignoresSafeArea()
               }
           }
-          EOF_FILE_5
-          cat > App/ModelLibrary.swift <<'EOF_FILE_6'
+          SWIFTEOF
+          cat > App/ModelLibrary.swift << 'SWIFTEOF'
           import Foundation
 
           struct HFModel: Identifiable, Decodable, Hashable {
@@ -537,6 +1118,7 @@ jobs:
           @MainActor
           final class ModelLibrary: ObservableObject {
               static let defaults = [
+                  "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit",
                   "mlx-community/Qwen2.5-3B-Instruct-4bit",
                   "mlx-community/Qwen3-4B-4bit",
                   "mlx-community/Llama-3.2-3B-Instruct-4bit",
@@ -593,13 +1175,112 @@ jobs:
                   isSearching = false
               }
           }
-          EOF_FILE_6
-          cat > App/ModelsView.swift <<'EOF_FILE_7'
+          SWIFTEOF
+          cat > App/Models.swift << 'SWIFTEOF'
+          import Foundation
+
+          struct ChatItem: Identifiable, Codable {
+              enum Role: String, Codable { case user, assistant, tool }
+              var id = UUID()
+              var role: Role
+              var text: String
+              var toolName: String? = nil
+              var ok: Bool = true
+              var previewPath: String? = nil
+              var attachments: [String] = []
+          }
+
+          struct Project: Identifiable, Codable, Hashable {
+              var id = UUID()
+              var name: String
+              var folder: String
+          }
+
+          struct ChatThread: Identifiable, Codable {
+              var id = UUID()
+              var title: String
+              var projectID: UUID
+              var items: [ChatItem]
+              var date: Date = Date()
+          }
+
+          struct PendingQuestion: Identifiable {
+              let id = UUID()
+              let question: String
+              let options: [String]
+          }
+
+          /// Stima del peso di un modello a partire dal nome (es. "Qwen3-4B-4bit").
+          enum ModelInfo {
+              enum Weight { case ok, heavy, tooHeavy, unknown }
+
+              static var deviceRAMGB: Double {
+                  Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+              }
+
+              static func estimatedGB(_ id: String) -> Double? {
+                  let name = id.split(separator: "/").last.map(String.init) ?? id
+                  let ns = name as NSString
+
+                  // numero di parametri: 4B, 1.5B, 270M ...
+                  guard let paramRe = try? NSRegularExpression(
+                      pattern: #"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)([BbMm])(?![A-Za-z])"#),
+                        let m = paramRe.firstMatch(in: name, range: NSRange(location: 0, length: ns.length)),
+                        let number = Double(ns.substring(with: m.range(at: 1)))
+                  else { return nil }
+                  let unit = ns.substring(with: m.range(at: 2)).lowercased()
+                  let billions = unit == "b" ? number : number / 1000
+
+                  // bit per peso
+                  var bits = 16.0
+                  let lower = name.lowercased()
+                  if let bitRe = try? NSRegularExpression(pattern: #"(\d+)[-_ ]?bit"#),
+                     let bm = bitRe.firstMatch(in: lower, range: NSRange(location: 0, length: (lower as NSString).length)),
+                     let b = Double((lower as NSString).substring(with: bm.range(at: 1))) {
+                      bits = b
+                  } else if lower.contains("fp4") {
+                      bits = 4
+                  } else if lower.contains("fp8") {
+                      bits = 8
+                  }
+                  return billions * bits / 8 * 1.12
+              }
+
+              static func weight(_ id: String) -> Weight {
+                  guard let gb = estimatedGB(id) else { return .unknown }
+                  let ram = deviceRAMGB
+                  if gb > ram * 0.42 { return .tooHeavy }
+                  if gb > ram * 0.28 { return .heavy }
+                  return .ok
+              }
+
+              static func sizeLabel(_ id: String) -> String {
+                  guard let gb = estimatedGB(id) else { return "" }
+                  return String(format: "≈ %.1f GB", gb)
+              }
+
+              static func warning(_ id: String) -> String {
+                  let size = sizeLabel(id)
+                  let ram = String(format: "%.0f", deviceRAMGB)
+                  switch weight(id) {
+                  case .tooHeavy:
+                      return "Questo modello (\(size)) è troppo grande per un iPhone con \(ram) GB di memoria: molto probabilmente l'app si chiuderà da sola. Puoi provare lo stesso, ma è meglio scegliere un modello più piccolo."
+                  case .heavy:
+                      return "Questo modello (\(size)) è pesante per un iPhone con \(ram) GB di memoria: potrebbe essere lento o chiudere l'app. Vuoi provarlo?"
+                  default:
+                      return ""
+                  }
+              }
+          }
+          SWIFTEOF
+          cat > App/ModelsView.swift << 'SWIFTEOF'
           import SwiftUI
 
+          /// Dove si scaricano e si scelgono i modelli.
           struct ModelsView: View {
               @ObservedObject var library: ModelLibrary
               @ObservedObject var agent: AgentViewModel
+              var onChoose: (String) -> Void
               @Environment(\.dismiss) private var dismiss
               @State private var query = ""
               @State private var manualID = ""
@@ -607,23 +1288,16 @@ jobs:
               var body: some View {
                   NavigationStack {
                       List {
-                          Section("I tuoi modelli") {
+                          Section {
                               ForEach(library.saved, id: \.self) { id in
-                                  Button { choose(id) } label: {
-                                      HStack {
-                                          VStack(alignment: .leading, spacing: 2) {
-                                              Text(short(id)).font(.body)
-                                              Text(id).font(.caption).foregroundStyle(.secondary)
-                                          }
-                                          Spacer()
-                                          if agent.currentModelID == id && agent.isReady {
-                                              Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                                          }
-                                      }
-                                  }
-                                  .foregroundStyle(.primary)
+                                  Button { onChoose(id) } label: { row(id, selected: id == agent.currentModelID && agent.isReady) }
+                                      .foregroundStyle(.primary)
                               }
                               .onDelete(perform: library.remove)
+                          } header: {
+                              Text("I tuoi modelli")
+                          } footer: {
+                              Text("Tocca un modello per usarlo: la prima volta viene scaricato. Scorri a sinistra per toglierlo dalla lista.")
                           }
 
                           Section {
@@ -635,13 +1309,18 @@ jobs:
                                   guard id.contains("/") else { return }
                                   library.add(id)
                                   manualID = ""
-                                  choose(id)
+                                  onChoose(id)
                               }
                               .disabled(!manualID.contains("/"))
+                              if let url = URL(string: "https://huggingface.co/mlx-community") {
+                                  Link(destination: url) {
+                                      Label("Sfoglia i modelli su Hugging Face", systemImage: "safari")
+                                  }
+                              }
                           } header: {
-                              Text("Incolla un modello da Hugging Face")
+                              Text("Dove scaricarli")
                           } footer: {
-                              Text("Servono modelli in formato MLX (di solito sotto mlx-community). Più grande è il modello, più RAM serve: sotto i 4 miliardi di parametri a 4 bit è la zona sicura.")
+                              Text("I modelli si scaricano da Hugging Face. Copia il nome del modello (es. mlx-community/Qwen3-4B-4bit) e incollalo qui sopra. Servono modelli in formato MLX. Puoi usare qualsiasi modello: se è troppo grande per il tuo iPhone ti avviso prima.")
                           }
 
                           if library.isSearching {
@@ -651,15 +1330,18 @@ jobs:
                               Section { Text(err).foregroundStyle(.orange) }
                           }
                           if !library.results.isEmpty {
-                              Section("Risultati") {
+                              Section("Risultati della ricerca") {
                                   ForEach(library.results) { model in
                                       Button {
                                           library.add(model.id)
-                                          choose(model.id)
+                                          onChoose(model.id)
                                       } label: {
                                           VStack(alignment: .leading, spacing: 2) {
-                                              Text(model.id).font(.subheadline)
-                                              Text("↓ \(model.downloads ?? 0)   ♥ \(model.likes ?? 0)")
+                                              HStack {
+                                                  Text(model.id).font(.subheadline)
+                                                  weightIcon(model.id)
+                                              }
+                                              Text("\(ModelInfo.sizeLabel(model.id))   ↓ \(model.downloads ?? 0)   ♥ \(model.likes ?? 0)")
                                                   .font(.caption).foregroundStyle(.secondary)
                                           }
                                       }
@@ -670,7 +1352,7 @@ jobs:
                       }
                       .navigationTitle("Modelli")
                       .navigationBarTitleDisplayMode(.inline)
-                      .searchable(text: $query, prompt: "Cerca su Hugging Face (MLX)")
+                      .searchable(text: $query, prompt: "Cerca su Hugging Face")
                       .onSubmit(of: .search) {
                           Task { await library.search(query) }
                       }
@@ -682,39 +1364,510 @@ jobs:
                   }
               }
 
-              private func short(_ id: String) -> String {
-                  id.split(separator: "/").last.map(String.init) ?? id
+              private func row(_ id: String, selected: Bool) -> some View {
+                  HStack {
+                      VStack(alignment: .leading, spacing: 2) {
+                          HStack(spacing: 6) {
+                              Text(id.split(separator: "/").last.map(String.init) ?? id)
+                              weightIcon(id)
+                          }
+                          Text("\(ModelInfo.sizeLabel(id))  \(id)")
+                              .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                      }
+                      Spacer()
+                      if selected {
+                          Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                      }
+                  }
               }
 
-              private func choose(_ id: String) {
-                  guard !agent.isGenerating, !agent.isLoading else { return }
-                  dismiss()
-                  Task { await agent.loadModel(id) }
+              @ViewBuilder
+              private func weightIcon(_ id: String) -> some View {
+                  switch ModelInfo.weight(id) {
+                  case .heavy:
+                      Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                  case .tooHeavy:
+                      Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                  default:
+                      EmptyView()
+                  }
               }
           }
-          EOF_FILE_7
-          cat > App/Workspace.swift <<'EOF_FILE_8'
+          SWIFTEOF
+          cat > App/SideMenu.swift << 'SWIFTEOF'
+          import SwiftUI
+
+          struct SideMenu: View {
+              @ObservedObject var store: Store
+              var onNewChat: () -> Void
+              var onOpen: (ChatThread) -> Void
+              var onDelete: (UUID) -> Void
+              var onSheet: (ActiveSheet) -> Void
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 2) {
+                      HStack(spacing: 10) {
+                          Image(systemName: "sparkles").font(.title2)
+                          Text("Agente Locale").font(.title3.bold())
+                      }
+                      .padding(.horizontal, 18)
+                      .padding(.top, 22)
+                      .padding(.bottom, 12)
+
+                      menuRow("Nuova chat", icon: "square.and.pencil", action: onNewChat)
+                      menuRow("Progetti", icon: "square.stack.3d.up", detail: store.currentProject.name) {
+                          onSheet(.projects)
+                      }
+                      menuRow("File del progetto", icon: "folder") { onSheet(.files) }
+                      menuRow("Add-on", icon: "puzzlepiece.extension") { onSheet(.addons) }
+                      menuRow("Impostazioni", icon: "gearshape") { onSheet(.settings) }
+
+                      Divider().padding(.vertical, 10).padding(.horizontal, 12)
+
+                      Text("Le tue chat")
+                          .font(.footnote.weight(.semibold))
+                          .foregroundStyle(.secondary)
+                          .padding(.horizontal, 18)
+                          .padding(.bottom, 4)
+
+                      ScrollView {
+                          LazyVStack(alignment: .leading, spacing: 2) {
+                              if store.threads.isEmpty {
+                                  Text("Nessuna chat ancora")
+                                      .font(.footnote)
+                                      .foregroundStyle(.secondary)
+                                      .padding(.horizontal, 18)
+                                      .padding(.vertical, 6)
+                              }
+                              ForEach(store.threads) { thread in
+                                  chatRow(thread)
+                              }
+                          }
+                      }
+                  }
+                  .padding(.bottom, 8)
+              }
+
+              private func menuRow(_ title: String, icon: String, detail: String? = nil,
+                                   action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      HStack(spacing: 14) {
+                          Image(systemName: icon).frame(width: 26)
+                          VStack(alignment: .leading, spacing: 1) {
+                              Text(title)
+                              if let detail {
+                                  Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                              }
+                          }
+                          Spacer()
+                      }
+                      .padding(.horizontal, 18)
+                      .padding(.vertical, 10)
+                      .contentShape(Rectangle())
+                  }
+                  .buttonStyle(.plain)
+              }
+
+              private func chatRow(_ thread: ChatThread) -> some View {
+                  let projectName = store.projects.first(where: { $0.id == thread.projectID })?.name ?? ""
+                  let isCurrent = thread.id == store.currentThreadID
+                  return Button { onOpen(thread) } label: {
+                      VStack(alignment: .leading, spacing: 1) {
+                          Text(thread.title).lineLimit(1)
+                          Text(projectName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                      }
+                      .frame(maxWidth: .infinity, alignment: .leading)
+                      .padding(.horizontal, 18)
+                      .padding(.vertical, 8)
+                      .background(isCurrent ? Color.white.opacity(0.10) : Color.clear)
+                      .contentShape(Rectangle())
+                  }
+                  .buttonStyle(.plain)
+                  .contextMenu {
+                      Button(role: .destructive) { onDelete(thread.id) } label: {
+                          Label("Elimina chat", systemImage: "trash")
+                      }
+                  }
+              }
+          }
+
+          // MARK: Progetti
+
+          struct ProjectsView: View {
+              @ObservedObject var agent: AgentViewModel
+              @ObservedObject var store: Store
+              @Environment(\.dismiss) private var dismiss
+              @State private var showNew = false
+              @State private var newName = ""
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section {
+                              ForEach(store.projects) { project in
+                                  Button {
+                                      agent.selectProject(project)
+                                      dismiss()
+                                  } label: {
+                                      HStack {
+                                          Image(systemName: "folder")
+                                          Text(project.name)
+                                          Spacer()
+                                          if project.id == store.currentProjectID {
+                                              Image(systemName: "checkmark").foregroundStyle(.green)
+                                          }
+                                      }
+                                  }
+                                  .foregroundStyle(.primary)
+                              }
+                              .onDelete { offsets in
+                                  for i in offsets { agent.deleteProject(store.projects[i]) }
+                              }
+                          } footer: {
+                              Text("Ogni progetto è una cartella con i suoi file. L'agente lavora solo dentro il progetto attivo. Scorri a sinistra per eliminare un progetto.")
+                          }
+                      }
+                      .navigationTitle("Progetti")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .topBarLeading) {
+                              Button { showNew = true } label: { Image(systemName: "plus") }
+                          }
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Fine") { dismiss() }
+                          }
+                      }
+                      .alert("Nuovo progetto", isPresented: $showNew) {
+                          TextField("Nome del progetto", text: $newName)
+                          Button("Crea") {
+                              let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+                              newName = ""
+                              if !name.isEmpty {
+                                  agent.createProject(name)
+                                  dismiss()
+                              }
+                          }
+                          Button("Annulla", role: .cancel) { newName = "" }
+                      }
+                  }
+              }
+          }
+
+          // MARK: Add-on
+
+          struct AddonsView: View {
+              @ObservedObject var agent: AgentViewModel
+              @Environment(\.dismiss) private var dismiss
+              @AppStorage("addon.web") private var web = false
+              @AppStorage("addon.clipboard") private var clipboard = false
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section {
+                              Toggle(isOn: $web) {
+                                  addonLabel("Navigazione web", icon: "globe",
+                                             text: "L'agente può leggere una pagina internet che gli indichi.")
+                              }
+                              Toggle(isOn: $clipboard) {
+                                  addonLabel("Appunti", icon: "doc.on.clipboard",
+                                             text: "L'agente può copiare un testo negli appunti, pronto da incollare altrove.")
+                              }
+                          } footer: {
+                              Text("Gli add-on danno nuove capacità all'agente. Sono spenti finché non li accendi.")
+                          }
+                      }
+                      .navigationTitle("Add-on")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Fine") { dismiss() }
+                          }
+                      }
+                      .onChange(of: web) { _, _ in agent.addonsChanged() }
+                      .onChange(of: clipboard) { _, _ in agent.addonsChanged() }
+                  }
+              }
+
+              private func addonLabel(_ title: String, icon: String, text: String) -> some View {
+                  HStack(spacing: 12) {
+                      Image(systemName: icon).frame(width: 28).foregroundStyle(.teal)
+                      VStack(alignment: .leading, spacing: 2) {
+                          Text(title)
+                          Text(text).font(.caption).foregroundStyle(.secondary)
+                      }
+                  }
+              }
+          }
+
+          // MARK: Impostazioni
+
+          struct SettingsView: View {
+              @ObservedObject var agent: AgentViewModel
+              @Environment(\.dismiss) private var dismiss
+              @AppStorage("maxSteps") private var maxSteps = 12
+              @AppStorage("confirmDelete") private var confirmDelete = true
+              @State private var confirmClear = false
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section {
+                              Stepper("Passaggi per ogni ordine: \(maxSteps)", value: $maxSteps, in: 4...30)
+                          } header: {
+                              Text("Lavoro dell'agente")
+                          } footer: {
+                              Text("Più passaggi permettono lavori più grandi, come un sito intero, ma richiedono più tempo.")
+                          }
+
+                          Section {
+                              Toggle("Chiedi prima di eliminare file", isOn: $confirmDelete)
+                          }
+
+                          Section("Il tuo iPhone") {
+                              LabeledContent("Memoria (RAM)", value: String(format: "%.0f GB", ModelInfo.deviceRAMGB))
+                              Text("Per stare tranquilli scegli modelli che pesano meno di circa \(String(format: "%.1f", ModelInfo.deviceRAMGB * 0.28)) GB. Oltre \(String(format: "%.1f", ModelInfo.deviceRAMGB * 0.42)) GB l'app rischia di chiudersi.")
+                                  .font(.footnote)
+                                  .foregroundStyle(.secondary)
+                          }
+
+                          Section {
+                              Button("Elimina tutte le chat", role: .destructive) { confirmClear = true }
+                          }
+
+                          Section("Informazioni") {
+                              Text("Tutto gira sul telefono: i tuoi file e le tue chat non escono dal dispositivo. I file dei progetti li trovi anche nell'app File, sotto «Su iPhone» > «Agente Locale» > «Progetti».")
+                                  .font(.footnote)
+                                  .foregroundStyle(.secondary)
+                          }
+                      }
+                      .navigationTitle("Impostazioni")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Fine") { dismiss() }
+                          }
+                      }
+                      .confirmationDialog("Eliminare tutte le chat?", isPresented: $confirmClear, titleVisibility: .visible) {
+                          Button("Elimina", role: .destructive) { agent.clearAllChats() }
+                      }
+                  }
+              }
+          }
+          SWIFTEOF
+          cat > App/Store.swift << 'SWIFTEOF'
           import Foundation
+
+          /// Progetti (cartelle di file) e chat salvate.
+          @MainActor
+          final class Store: ObservableObject {
+              @Published var projects: [Project] = []
+              @Published var threads: [ChatThread] = []
+              @Published var currentProjectID = UUID()
+              @Published var currentThreadID: UUID?
+
+              private let dir: URL
+              private let projectsRoot: URL
+
+              init() {
+                  let fm = FileManager.default
+                  let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                  dir = support.appendingPathComponent("AgenteLocale", isDirectory: true)
+                  try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                  let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                  projectsRoot = docs.appendingPathComponent("Progetti", isDirectory: true)
+                  try? fm.createDirectory(at: projectsRoot, withIntermediateDirectories: true)
+
+                  var loaded = Store.load([Project].self, from: dir.appendingPathComponent("projects.json")) ?? []
+                  if loaded.isEmpty {
+                      loaded = [Project(name: "Il mio progetto", folder: "Il mio progetto")]
+                  }
+                  projects = loaded
+                  threads = Store.load([ChatThread].self, from: dir.appendingPathComponent("chats.json")) ?? []
+
+                  let savedID = UserDefaults.standard.string(forKey: "currentProject").flatMap(UUID.init(uuidString:))
+                  currentProjectID = loaded.first(where: { $0.id == savedID })?.id ?? loaded[0].id
+                  for p in projects { ensureFolder(p) }
+                  persist()
+              }
+
+              var currentProject: Project {
+                  projects.first(where: { $0.id == currentProjectID }) ?? projects[0]
+              }
+
+              func folderURL(_ p: Project) -> URL {
+                  projectsRoot.appendingPathComponent(p.folder, isDirectory: true)
+              }
+
+              var currentFolder: URL { folderURL(currentProject) }
+
+              private func ensureFolder(_ p: Project) {
+                  try? FileManager.default.createDirectory(at: folderURL(p), withIntermediateDirectories: true)
+              }
+
+              // MARK: Progetti
+
+              @discardableResult
+              func createProject(name: String) -> Project {
+                  var clean = name
+                      .replacingOccurrences(of: "/", with: "-")
+                      .replacingOccurrences(of: ":", with: "-")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+                  if clean.isEmpty { clean = "Progetto" }
+                  var folder = clean
+                  var n = 2
+                  while projects.contains(where: { $0.folder == folder }) {
+                      folder = "\(clean) \(n)"
+                      n += 1
+                  }
+                  let p = Project(name: clean, folder: folder)
+                  projects.append(p)
+                  ensureFolder(p)
+                  persist()
+                  return p
+              }
+
+              func selectProject(_ p: Project) {
+                  currentProjectID = p.id
+                  UserDefaults.standard.set(p.id.uuidString, forKey: "currentProject")
+              }
+
+              func deleteProject(_ p: Project) {
+                  guard projects.count > 1 else { return }
+                  try? FileManager.default.removeItem(at: folderURL(p))
+                  projects.removeAll { $0.id == p.id }
+                  threads.removeAll { $0.projectID == p.id }
+                  if currentProjectID == p.id { selectProject(projects[0]) }
+                  persist()
+              }
+
+              // MARK: Chat
+
+              func save(_ thread: ChatThread) {
+                  var t = thread
+                  t.date = Date()
+                  threads.removeAll { $0.id == t.id }
+                  threads.insert(t, at: 0)
+                  persist()
+              }
+
+              func deleteThread(_ id: UUID) {
+                  threads.removeAll { $0.id == id }
+                  persist()
+              }
+
+              func deleteAllThreads() {
+                  threads = []
+                  persist()
+              }
+
+              // MARK: Salvataggio
+
+              private func persist() {
+                  if let d = try? JSONEncoder().encode(projects) {
+                      try? d.write(to: dir.appendingPathComponent("projects.json"), options: .atomic)
+                  }
+                  if let d = try? JSONEncoder().encode(threads) {
+                      try? d.write(to: dir.appendingPathComponent("chats.json"), options: .atomic)
+                  }
+              }
+
+              private static func load<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
+                  guard let data = try? Data(contentsOf: url) else { return nil }
+                  return try? JSONDecoder().decode(type, from: data)
+              }
+          }
+          SWIFTEOF
+          cat > App/WebPreview.swift << 'SWIFTEOF'
+          import SwiftUI
+          import WebKit
+
+          struct PreviewTarget: Identifiable {
+              let url: URL
+              let root: URL
+              var id: String { url.path }
+          }
+
+          struct WebView: UIViewRepresentable {
+              let url: URL
+              let readAccess: URL
+
+              func makeUIView(context: Context) -> WKWebView {
+                  let web = WKWebView(frame: .zero)
+                  web.isOpaque = false
+                  web.backgroundColor = .clear
+                  web.loadFileURL(url, allowingReadAccessTo: readAccess)
+                  return web
+              }
+
+              func updateUIView(_ uiView: WKWebView, context: Context) {}
+          }
+
+          struct PreviewSheet: View {
+              let target: PreviewTarget
+              @Environment(\.dismiss) private var dismiss
+
+              var body: some View {
+                  NavigationStack {
+                      WebView(url: target.url, readAccess: target.root)
+                          .ignoresSafeArea(edges: .bottom)
+                          .navigationTitle(target.url.lastPathComponent)
+                          .navigationBarTitleDisplayMode(.inline)
+                          .toolbar {
+                              ToolbarItem(placement: .confirmationAction) {
+                                  Button("Fine") { dismiss() }
+                              }
+                          }
+                  }
+              }
+          }
+          SWIFTEOF
+          cat > App/Workspace.swift << 'SWIFTEOF'
+          import Foundation
+          import UIKit
+          import PDFKit
+          import Vision
 
           struct ToolCall {
               let name: String
               let args: [String: Any]
 
+              private var path: String { (args["path"] as? String) ?? "" }
+
+              /// Descrizione semplice, pensata per chi non è tecnico.
               var summary: String {
-                  let path = (args["path"] as? String) ?? ""
-                  return path.isEmpty ? name : "\(name)  \(path)"
+                  switch name {
+                  case "write_file": return "Scrivo «\(path)»"
+                  case "append_file": return "Aggiungo testo a «\(path)»"
+                  case "replace_in_file": return "Modifico «\(path)»"
+                  case "read_file": return "Leggo «\(path)»"
+                  case "list_files": return "Guardo i file del progetto"
+                  case "make_dir": return "Creo la cartella «\(path)»"
+                  case "delete_file": return "Elimino «\(path)»"
+                  case "fetch_url": return "Leggo una pagina web"
+                  case "copy_to_clipboard": return "Copio negli appunti"
+                  default: return name
+                  }
+              }
+
+              var icon: String {
+                  switch name {
+                  case "write_file", "append_file": return "doc.badge.plus"
+                  case "replace_in_file": return "pencil"
+                  case "read_file": return "doc.text.magnifyingglass"
+                  case "list_files", "make_dir": return "folder"
+                  case "delete_file": return "trash"
+                  case "fetch_url": return "globe"
+                  case "copy_to_clipboard": return "doc.on.clipboard"
+                  default: return "gearshape"
+                  }
               }
           }
 
-          /// Cartella sandbox dove l'agente può lavorare.
-          /// È visibile anche nell'app File (Su iPhone > Agente Locale > Workspace).
+          /// Cartella del progetto attivo, dove l'agente può lavorare.
+          /// È visibile anche nell'app File (Su iPhone > Agente Locale > Progetti).
           enum Workspace {
-              static let root: URL = {
-                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                  let url = docs.appendingPathComponent("Workspace", isDirectory: true)
-                  try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                  return url
-              }()
+              static var root: URL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
               struct WSError: LocalizedError {
                   let message: String
@@ -728,7 +1881,7 @@ jobs:
                   let std = url.standardizedFileURL
                   let rootPath = root.standardizedFileURL.path
                   guard std.path == rootPath || std.path.hasPrefix(rootPath + "/") else {
-                      throw WSError(message: "Percorso fuori dal workspace: \(path)")
+                      throw WSError(message: "Percorso fuori dal progetto: \(path)")
                   }
                   return std
               }
@@ -752,6 +1905,29 @@ jobs:
                       if !isDir { result.append(url) }
                   }
                   return result.sorted { $0.path < $1.path }
+              }
+
+              /// Legge testo da file di testo, PDF e foto (riconoscimento del testo nelle immagini).
+              static func readText(_ url: URL) throws -> String {
+                  switch url.pathExtension.lowercased() {
+                  case "pdf":
+                      guard let doc = PDFDocument(url: url) else { throw WSError(message: "PDF non leggibile") }
+                      let t = doc.string ?? ""
+                      return t.isEmpty ? "(il PDF non contiene testo leggibile)" : t
+                  case "png", "jpg", "jpeg", "heic", "heif":
+                      guard let cg = UIImage(contentsOfFile: url.path)?.cgImage else {
+                          throw WSError(message: "immagine non leggibile")
+                      }
+                      let request = VNRecognizeTextRequest()
+                      request.recognitionLevel = .accurate
+                      request.usesLanguageCorrection = true
+                      let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+                      try handler.perform([request])
+                      let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                      return lines.isEmpty ? "(nessun testo riconosciuto nell'immagine)" : lines.joined(separator: "\n")
+                  default:
+                      return try String(contentsOf: url, encoding: .utf8)
+                  }
               }
 
               static func run(_ call: ToolCall) -> (ok: Bool, output: String) {
@@ -778,7 +1954,7 @@ jobs:
                           guard let path = str("path") else { throw WSError(message: "manca 'path'") }
                           let url = try resolve(path)
                           guard fm.fileExists(atPath: url.path) else { throw WSError(message: "file non trovato: \(path)") }
-                          let text = try String(contentsOf: url, encoding: .utf8)
+                          let text = try readText(url)
                           if text.count > 8000 {
                               return (true, String(text.prefix(8000)) + "\n…[troncato, \(text.count) caratteri totali]")
                           }
@@ -825,7 +2001,7 @@ jobs:
                           guard let path = str("path") else { throw WSError(message: "manca 'path'") }
                           let url = try resolve(path)
                           guard url.path != root.standardizedFileURL.path else {
-                              throw WSError(message: "non puoi cancellare la radice")
+                              throw WSError(message: "non puoi cancellare la cartella del progetto")
                           }
                           guard fm.fileExists(atPath: url.path) else { throw WSError(message: "non trovato: \(path)") }
                           try fm.removeItem(at: url)
@@ -840,56 +2016,147 @@ jobs:
               }
           }
 
-          /// Estrae le chiamate ai tool dal testo generato dal modello.
+          /// Prompt di sistema e lettura dei comandi generati dal modello.
           enum ToolParser {
-              static let systemPrompt = #"""
-              You are a local on-device agent running on an iPhone. You help the user by working with files in a private workspace folder.
+              static func systemPrompt(web: Bool, clipboard: Bool) -> String {
+                  var extraTools = ""
+                  if web { extraTools += "\n- fetch_url {\"url\": \"https://...\"} : read the text of a web page" }
+                  if clipboard { extraTools += "\n- copy_to_clipboard {\"text\": \"...\"} : copy text to the user's clipboard" }
 
-              To use a tool, output EXACTLY this format and then stop writing:
-              <tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>
-              You will then receive the result inside <tool_response> and can continue. Call one tool at a time.
-              When the task is finished, answer normally WITHOUT any tool call, briefly, in the user's language.
+                  return #"""
+                  You are "Agente Locale", a friendly assistant that runs entirely on the user's iPhone. The user is NOT technical: speak simply, never use jargon, never show code in your replies. You work like a careful developer: when the user asks for something (a website, a text, a file...), you do the whole job yourself by creating and editing files in the user's project folder, and only at the end you reply with a short, simple summary (1-3 sentences) in the user's language.
 
-              Tools:
-              - list_files {"path": "."} : list a folder
-              - read_file {"path": "notes.txt"} : read a text file
-              - write_file {"path": "dir/file.txt", "content": "..."} : create or overwrite a file
-              - append_file {"path": "file.txt", "content": "..."} : add text at the end of a file
-              - replace_in_file {"path": "file.txt", "old": "exact old text", "new": "new text"} : replace the first occurrence
-              - make_dir {"path": "dir"} : create a folder
-              - delete_file {"path": "file.txt"} : delete a file or folder
+                  HOW TO USE TOOLS
+                  Use one tool per turn, then stop and wait for the result.
 
-              Rules: paths are relative to the workspace. Always read a file before editing it. Never invent the content of files you have not read. Use valid JSON (escape newlines as \n inside strings).
-              """#
+                  1) To create or overwrite a file, write exactly:
+                  <write_file path="index.html">
+                  ...the full content of the file...
+                  </write_file>
+                  To add text at the end of a file, use <append_file path="notes.txt">...</append_file> in the same way.
 
+                  2) For every other tool, write exactly:
+                  <tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>
+
+                  Tools:
+                  - list_files {"path": "."} : list a folder
+                  - read_file {"path": "notes.txt"} : read a file (works for text, PDF and photos that contain text)
+                  - replace_in_file {"path": "index.html", "old": "exact old text", "new": "new text"} : replace the first occurrence
+                  - make_dir {"path": "images"} : create a folder
+                  - delete_file {"path": "old.txt"} : delete a file or folder
+                  - ask_user {"question": "Short question?", "options": ["Round", "Square"]} : ask the user and wait for the answer. Use it ONLY when you really need a choice that you cannot reasonably decide yourself (for example a name or a style). Ask one simple question at a time. "options" is optional.
+                  """# + extraTools + #"""
+
+
+                  RULES
+                  - Paths are relative to the project folder.
+                  - Websites: build a complete, beautiful, modern, mobile-friendly site as ONE self-contained index.html (CSS inside <style>, JavaScript inside <script>, no external libraries, no images from the internet: use emojis, gradients and CSS shapes). Never stop halfway: write the whole file.
+                  - Read a file before you edit it. Never invent the content of files you have not read.
+                  - Decide the small things yourself. Do not ask permission for every step.
+                  - Never put a tool and a final answer in the same turn. After the last tool result, give the final short answer with no tool.
+                  - Files attached by the user are already in the project folder: use read_file to look at them.
+                  """#
+              }
+
+              private static let markers = ["<tool_call>", "<write_file", "<append_file"]
+
+              static func hasCompleteCall(_ s: String) -> Bool {
+                  s.contains("</tool_call>") || s.contains("</write_file>") || s.contains("</append_file>")
+              }
+
+              static func hasUnclosedBlock(_ s: String) -> Bool {
+                  for tag in ["write_file", "append_file"] {
+                      let opens = s.components(separatedBy: "<\(tag)").count - 1
+                      let closes = s.components(separatedBy: "</\(tag)>").count - 1
+                      if opens > closes { return true }
+                  }
+                  return false
+              }
+
+              /// Testo da mostrare all'utente (senza comandi e senza ragionamenti interni).
               static func visibleText(_ s: String) -> String {
                   var text = s
-                  // Rimuove i blocchi di ragionamento <think>...</think>
                   if let re = try? NSRegularExpression(pattern: #"<think>[\s\S]*?</think>"#) {
                       text = re.stringByReplacingMatches(
                           in: text, range: NSRange(location: 0, length: (text as NSString).length), withTemplate: "")
                   }
                   if let r = text.range(of: "<think>") { text = String(text[..<r.lowerBound]) }
-                  if let r = text.range(of: "<tool_call>") { text = String(text[..<r.lowerBound]) }
+                  var cut: String.Index? = nil
+                  for marker in markers {
+                      if let r = text.range(of: marker), cut == nil || r.lowerBound < cut! { cut = r.lowerBound }
+                  }
+                  if let cut { text = String(text[..<cut]) }
                   return text.trimmingCharacters(in: .whitespacesAndNewlines)
               }
 
+              /// Cosa sta facendo l'agente in questo momento (per l'indicatore di attività).
+              static func activity(_ s: String) -> String? {
+                  for (tag, verb) in [("write_file", "Scrivo"), ("append_file", "Aggiungo testo a")] {
+                      if let r = s.range(of: "<\(tag)") {
+                          let tail = String(s[r.upperBound...])
+                          var name = "un file"
+                          if let re = try? NSRegularExpression(pattern: #"path=["']([^"'>]+)["']"#),
+                             let m = re.firstMatch(in: tail, range: NSRange(location: 0, length: (tail as NSString).length)) {
+                              name = "«" + (tail as NSString).substring(with: m.range(at: 1)) + "»"
+                          }
+                          let count = tail.count
+                          return "\(verb) \(name)… (\(count) caratteri)"
+                      }
+                  }
+                  if s.contains("<tool_call>") { return "Preparo un'azione…" }
+                  if s.contains("<think>") && !s.contains("</think>") { return "Sto pensando…" }
+                  if visibleText(s).isEmpty { return "Sto pensando…" }
+                  return nil
+              }
+
               static func parse(_ text: String) -> [ToolCall] {
-                  var jsons: [String] = []
-                  let pattern = #"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#
-                  if let re = try? NSRegularExpression(pattern: pattern) {
-                      let ns = text as NSString
-                      for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-                          jsons.append(ns.substring(with: m.range(at: 1)))
+                  var found: [(Int, ToolCall)] = []
+                  let ns = text as NSString
+                  let full = NSRange(location: 0, length: ns.length)
+
+                  // Blocchi <write_file path="..."> ... </write_file>
+                  for tag in ["write_file", "append_file"] {
+                      let pattern = #"<\#(tag)\s+path=["']([^"'>]+)["']\s*>([\s\S]*?)</\#(tag)>"#
+                      guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+                      for m in re.matches(in: text, range: full) {
+                          let path = ns.substring(with: m.range(at: 1))
+                          let content = cleanContent(ns.substring(with: m.range(at: 2)))
+                          found.append((m.range.location, ToolCall(name: tag, args: ["path": path, "content": content])))
+                      }
+                  }
+
+                  // Chiamate JSON <tool_call>{...}</tool_call>
+                  var jsons: [(Int, String)] = []
+                  if let re = try? NSRegularExpression(pattern: #"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#) {
+                      for m in re.matches(in: text, range: full) {
+                          jsons.append((m.range.location, ns.substring(with: m.range(at: 1))))
                       }
                   }
                   if jsons.isEmpty, let r = text.range(of: "<tool_call>") {
                       let tail = String(text[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                       if tail.hasPrefix("{"), let end = tail.lastIndex(of: "}") {
-                          jsons.append(String(tail[...end]))
+                          jsons.append((text.distance(from: text.startIndex, to: r.lowerBound), String(tail[...end])))
                       }
                   }
-                  return jsons.compactMap(decode)
+                  for (loc, json) in jsons {
+                      if let call = decode(json) { found.append((loc, call)) }
+                  }
+
+                  return found.sorted { $0.0 < $1.0 }.map { $0.1 }
+              }
+
+              private static func cleanContent(_ raw: String) -> String {
+                  var c = raw
+                  if c.hasPrefix("\n") { c.removeFirst() }
+                  if c.hasSuffix("\n") { c.removeLast() }
+                  let trimmed = c.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if trimmed.hasPrefix("```") {
+                      var lines = trimmed.components(separatedBy: "\n")
+                      lines.removeFirst()
+                      if let last = lines.last, last.trimmingCharacters(in: .whitespaces) == "```" { lines.removeLast() }
+                      c = lines.joined(separator: "\n")
+                  }
+                  return c
               }
 
               private static func decode(_ json: String) -> ToolCall? {
@@ -927,16 +2194,8 @@ jobs:
                   return out
               }
           }
-          EOF_FILE_8
-
-      - name: Installa XcodeGen
-        run: brew install xcodegen
-
-      - name: Metal toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
-
-      - name: Versione Xcode
-        run: xcodebuild -version
+          SWIFTEOF
+          ls -la App
 
       - name: Genera il progetto Xcode
         run: xcodegen generate
