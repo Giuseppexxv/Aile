@@ -20,6 +20,20 @@ jobs:
       - name: Versione Xcode
         run: xcodebuild -version
 
+      - name: Compila llama.cpp (motore per i modelli GGUF)
+        run: |
+          brew install cmake || true
+          git init llama.cpp
+          cd llama.cpp
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch --depth 1 origin 1b70350c92563449576bcbbf552994b1d1ed847d
+          git checkout FETCH_HEAD
+          ./build-xcframework.sh ios-device
+          cd ..
+          mkdir -p Frameworks
+          cp -R llama.cpp/build-apple/llama.xcframework Frameworks/
+          ls Frameworks/llama.xcframework
+
       - name: Crea tutti i file del progetto
         run: |
           mkdir -p App Support
@@ -44,6 +58,8 @@ jobs:
                   product: MLXLLM
                 - package: MLXSwiftLM
                   product: MLXLMCommon
+                - framework: Frameworks/llama.xcframework
+                  embed: true
               info:
                 path: Support/Info.plist
                 properties:
@@ -84,7 +100,8 @@ jobs:
               let store = Store()
 
               private var container: ModelContainer?
-              private var session: ChatSession?
+              private var session: LLMSession?
+              private var llamaModel: LlamaModel?
               private var task: Task<Void, Never>?
               private var continuation: CheckedContinuation<String, Never>?
               private var threadID = UUID()
@@ -109,16 +126,23 @@ jobs:
               private var clipboardOn: Bool { UserDefaults.standard.bool(forKey: "addon.clipboard") }
 
               var shortModelName: String {
-                  currentModelID?.split(separator: "/").last.map(String.init) ?? "Scegli un modello"
+                  currentModelID.map { ModelInfo.displayName($0) } ?? "Scegli un modello"
               }
 
               // MARK: Modello
 
               private func makeSession() {
-                  guard let container else { session = nil; return }
-                  session = ChatSession(
-                      container,
-                      instructions: ToolParser.systemPrompt(web: webOn, clipboard: clipboardOn))
+                  session = nil
+                  let prompt = ToolParser.systemPrompt(web: webOn, clipboard: clipboardOn)
+                  if let container {
+                      session = MLXSessionBox(ChatSession(container, instructions: prompt))
+                  } else if let llamaModel {
+                      do {
+                          session = try LlamaSession(model: llamaModel, system: prompt)
+                      } catch {
+                          loadError = error.localizedDescription
+                      }
+                  }
               }
 
               func addonsChanged() {
@@ -135,26 +159,47 @@ jobs:
                   downloadProgress = 0
                   session = nil
                   container = nil
+                  llamaModel = nil
                   currentModelID = id
 
                   do {
-                      let configuration = ModelConfiguration(id: id)
-                      let loaded = try await LLMModelFactory.shared.loadContainer(
-                          configuration: configuration
-                      ) { progress in
-                          Task { @MainActor in
-                              self.downloadProgress = progress.fractionCompleted
+                      if let ref = GGUFRef(id: id) {
+                          try await loadGGUF(ref)
+                      } else {
+                          let configuration = ModelConfiguration(id: id)
+                          let loaded = try await LLMModelFactory.shared.loadContainer(
+                              configuration: configuration
+                          ) { progress in
+                              Task { @MainActor in
+                                  self.downloadProgress = progress.fractionCompleted
+                              }
                           }
+                          container = loaded
                       }
-                      container = loaded
                       makeSession()
                       needsRecap = !items.isEmpty
-                      isReady = true
-                      UserDefaults.standard.set(id, forKey: "lastModel")
+                      isReady = session != nil
+                      if isReady { UserDefaults.standard.set(id, forKey: "lastModel") }
                   } catch {
-                      loadError = error.localizedDescription
+                      loadError = "Non sono riuscito ad aprire questo modello: potrebbe non essere supportato dall'app. (\(error.localizedDescription))"
                   }
                   isLoading = false
+              }
+
+              private func loadGGUF(_ ref: GGUFRef) async throws {
+                  let local = ref.localURL
+                  if !FileManager.default.fileExists(atPath: local.path) {
+                      guard let remote = ref.remoteURL else { throw LlamaError.badURL }
+                      let downloader = GGUFDownloader(destination: local) { [weak self] value in
+                          Task { @MainActor in self?.downloadProgress = value }
+                      }
+                      try await downloader.download(from: remote)
+                  }
+                  downloadProgress = 1
+                  let path = local.path
+                  llamaModel = try await Task.detached(priority: .userInitiated) {
+                      try LlamaModel(path: path)
+                  }.value
               }
 
               func loadLastModelIfNeeded() async {
@@ -342,7 +387,7 @@ jobs:
                   }
               }
 
-              private func runAgent(session: ChatSession, firstPrompt: String) async {
+              private func runAgent(session: LLMSession, firstPrompt: String) async {
                   var prompt = firstPrompt
                   let limit = maxSteps
                   for _ in 0..<limit {
@@ -530,8 +575,6 @@ jobs:
               @State private var input = ""
               @State private var showMenu = false
               @State private var sheet: ActiveSheet?
-              @State private var heavyModel: String?
-              @State private var showHeavyAlert = false
               @State private var showFileImporter = false
               @State private var showPhotoPicker = false
               @State private var photoItem: PhotosPickerItem?
@@ -578,12 +621,6 @@ jobs:
                       case .preview(let target): PreviewSheet(target: target)
                       }
                   }
-                  .alert("Modello pesante", isPresented: $showHeavyAlert, presenting: heavyModel) { id in
-                      Button("Prova lo stesso") { Task { await agent.loadModel(id) } }
-                      Button("Annulla", role: .cancel) {}
-                  } message: { id in
-                      Text(ModelInfo.warning(id))
-                  }
                   .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
                       if case .success(let urls) = result { agent.attachFiles(urls) }
                   }
@@ -605,15 +642,7 @@ jobs:
               private func choose(_ id: String) {
                   guard !agent.isLoading else { return }
                   if id == agent.currentModelID && agent.isReady { return }
-                  let present = {
-                      switch ModelInfo.weight(id) {
-                      case .heavy, .tooHeavy:
-                          heavyModel = id
-                          showHeavyAlert = true
-                      default:
-                          Task { await agent.loadModel(id) }
-                      }
-                  }
+                  let present = { Task { await agent.loadModel(id) } }
                   if sheet != nil {
                       sheet = nil
                       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { present() }
@@ -623,8 +652,7 @@ jobs:
               }
 
               private func menuTitle(_ id: String) -> String {
-                  let name = id.split(separator: "/").last.map(String.init) ?? id
-                  var title = name
+                  var title = ModelInfo.displayName(id)
                   let size = ModelInfo.sizeLabel(id)
                   if !size.isEmpty { title += " · " + size }
                   switch ModelInfo.weight(id) {
@@ -945,6 +973,439 @@ jobs:
               }
           }
           SWIFTEOF
+          cat > App/Engines.swift << 'SWIFTEOF'
+          import Foundation
+          import llama
+          import MLXLMCommon
+
+          // MARK: - Interfaccia comune ai due motori (MLX e GGUF)
+
+          protocol LLMSession: AnyObject {
+              func streamResponse(to prompt: String) -> AsyncThrowingStream<String, Error>
+          }
+
+          /// Adatta la sessione MLX all'interfaccia comune.
+          final class MLXSessionBox: LLMSession {
+              private let inner: ChatSession
+              init(_ inner: ChatSession) { self.inner = inner }
+
+              func streamResponse(to prompt: String) -> AsyncThrowingStream<String, Error> {
+                  let inner = self.inner
+                  return AsyncThrowingStream { continuation in
+                      let task = Task {
+                          do {
+                              for try await chunk in inner.streamResponse(to: prompt) {
+                                  continuation.yield(chunk)
+                              }
+                              continuation.finish()
+                          } catch {
+                              continuation.finish(throwing: error)
+                          }
+                      }
+                      continuation.onTermination = { _ in task.cancel() }
+                  }
+              }
+          }
+
+          // MARK: - Riferimento a un file GGUF su Hugging Face
+
+          /// Un modello GGUF si indica come  gguf:proprietario/repo:nome-file.gguf
+          struct GGUFRef {
+              let repo: String
+              let file: String
+
+              init?(id: String) {
+                  guard id.hasPrefix("gguf:") else { return nil }
+                  let rest = String(id.dropFirst(5))
+                  guard let colon = rest.firstIndex(of: ":") else { return nil }
+                  let r = String(rest[..<colon])
+                  let f = String(rest[rest.index(after: colon)...])
+                  guard r.contains("/"), !f.isEmpty else { return nil }
+                  repo = r
+                  file = f
+              }
+
+              static func makeID(repo: String, file: String) -> String {
+                  "gguf:\(repo):\(file)"
+              }
+
+              var localURL: URL {
+                  let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                  return base
+                      .appendingPathComponent("Models", isDirectory: true)
+                      .appendingPathComponent(repo.replacingOccurrences(of: "/", with: "__"), isDirectory: true)
+                      .appendingPathComponent(file)
+              }
+
+              var remoteURL: URL? {
+                  let encoded = file.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file
+                  return URL(string: "https://huggingface.co/\(repo)/resolve/main/\(encoded)")
+              }
+          }
+
+          // MARK: - Scaricamento con barra di avanzamento
+
+          enum LlamaError: LocalizedError {
+              case badURL
+              case http(Int)
+              case load
+              case context
+              case decode(Int32)
+              case tooLong
+
+              var errorDescription: String? {
+                  switch self {
+                  case .badURL: return "Indirizzo del modello non valido."
+                  case .http(let code): return "Il download è stato rifiutato (errore \(code)). Il modello potrebbe richiedere un accesso su Hugging Face."
+                  case .load: return "Non riesco ad aprire il file del modello."
+                  case .context: return "Non riesco a preparare la memoria di lavoro del modello."
+                  case .decode(let code): return "Il modello si è fermato (codice \(code))."
+                  case .tooLong: return "La conversazione è troppo lunga per questo modello. Apri una nuova chat."
+                  }
+              }
+          }
+
+          final class GGUFDownloader: NSObject, URLSessionDownloadDelegate {
+              private let destination: URL
+              private let onProgress: (Double) -> Void
+              private let lock = NSLock()
+              private var continuation: CheckedContinuation<Void, Error>?
+              private var session: URLSession?
+              private var task: URLSessionDownloadTask?
+
+              init(destination: URL, onProgress: @escaping (Double) -> Void) {
+                  self.destination = destination
+                  self.onProgress = onProgress
+              }
+
+              func download(from url: URL) async throws {
+                  try await withTaskCancellationHandler {
+                      try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                          lock.lock()
+                          continuation = c
+                          let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                          session = s
+                          let t = s.downloadTask(with: url)
+                          task = t
+                          lock.unlock()
+                          t.resume()
+                      }
+                  } onCancel: {
+                      self.lock.lock()
+                      let t = self.task
+                      self.lock.unlock()
+                      t?.cancel()
+                  }
+              }
+
+              private func finish(_ error: Error?) {
+                  lock.lock()
+                  let c = continuation
+                  continuation = nil
+                  let s = session
+                  lock.unlock()
+                  s?.finishTasksAndInvalidate()
+                  guard let c else { return }
+                  if let error { c.resume(throwing: error) } else { c.resume() }
+              }
+
+              func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                              didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                              totalBytesExpectedToWrite: Int64) {
+                  guard totalBytesExpectedToWrite > 0 else { return }
+                  onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+              }
+
+              func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                              didFinishDownloadingTo location: URL) {
+                  do {
+                      if let http = downloadTask.response as? HTTPURLResponse,
+                         !(200..<300).contains(http.statusCode) {
+                          throw LlamaError.http(http.statusCode)
+                      }
+                      let fm = FileManager.default
+                      try fm.createDirectory(at: destination.deletingLastPathComponent(),
+                                             withIntermediateDirectories: true)
+                      if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+                      try fm.moveItem(at: location, to: destination)
+                      finish(nil)
+                  } catch {
+                      finish(error)
+                  }
+              }
+
+              func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                  if let error { finish(error) }
+              }
+          }
+
+          // MARK: - Modello llama.cpp
+
+          final class LlamaModel: @unchecked Sendable {
+              let model: OpaquePointer
+              let fileName: String
+              private static var backendReady = false
+
+              init(path: String) throws {
+                  if !LlamaModel.backendReady {
+                      llama_backend_init()
+                      LlamaModel.backendReady = true
+                  }
+                  var params = llama_model_default_params()
+                  params.n_gpu_layers = 999
+                  guard let loaded = (llama_model_load_from_file(path, params) as OpaquePointer?) else {
+                      throw LlamaError.load
+                  }
+                  model = loaded
+                  fileName = (path as NSString).lastPathComponent
+              }
+
+              deinit { llama_model_free(model) }
+          }
+
+          /// Cancellazione sicura tra thread.
+          final class CancelFlag: @unchecked Sendable {
+              private let lock = NSLock()
+              private var value = false
+              func cancel() { lock.lock(); value = true; lock.unlock() }
+              var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return value }
+          }
+
+          /// Una conversazione con un modello GGUF: tiene la cronologia e riusa la memoria
+          /// già calcolata, così a ogni passo dell'agente si elabora solo la parte nuova.
+          final class LlamaSession: LLMSession, @unchecked Sendable {
+              private let llamaModel: LlamaModel
+              private let ctx: OpaquePointer
+              private let vocab: OpaquePointer
+              private let sampler: UnsafeMutablePointer<llama_sampler>
+              private let nCtx: Int
+              private let nBatch = 512
+              private let template: String
+              private let disableThinking: Bool
+              private let lock = NSLock()
+              private var messages: [(role: String, content: String)]
+              private var cached: [llama_token] = []
+
+              init(model: LlamaModel, system: String) throws {
+                  llamaModel = model
+
+                  let ram = ProcessInfo.processInfo.physicalMemory
+                  var wanted = ram >= 7_500_000_000 ? 8192 : 4096
+                  let trained = Int(llama_model_n_ctx_train(model.model))
+                  if trained > 0 { wanted = min(wanted, trained) }
+                  let ctxSize = max(1024, wanted)
+                  nCtx = ctxSize
+
+                  var cp = llama_context_default_params()
+                  cp.n_ctx = UInt32(ctxSize)
+                  cp.n_batch = 512
+                  cp.n_ubatch = 512
+                  let threads = Int32(max(2, min(6, ProcessInfo.processInfo.activeProcessorCount - 2)))
+                  cp.n_threads = threads
+                  cp.n_threads_batch = threads
+                  guard let c = (llama_init_from_model(model.model, cp) as OpaquePointer?) else {
+                      throw LlamaError.context
+                  }
+                  ctx = c
+                  guard let v = (llama_model_get_vocab(model.model) as OpaquePointer?) else {
+                      llama_free(c)
+                      throw LlamaError.load
+                  }
+                  vocab = v
+
+                  let chain: UnsafeMutablePointer<llama_sampler> = llama_sampler_chain_init(llama_sampler_chain_default_params())
+                  llama_sampler_chain_add(chain, llama_sampler_init_top_k(40))
+                  llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95, 1))
+                  llama_sampler_chain_add(chain, llama_sampler_init_temp(0.6))
+                  llama_sampler_chain_add(chain, llama_sampler_init_dist(UInt32.random(in: 0...UInt32.max)))
+                  sampler = chain
+
+                  let tptr: UnsafePointer<CChar>? = llama_model_chat_template(model.model, nil)
+                  template = tptr.map { String(cString: $0) } ?? "chatml"
+
+                  let lower = model.fileName.lowercased()
+                  disableThinking = lower.contains("qwen3") && !lower.contains("2507") && !lower.contains("coder")
+
+                  messages = [("system", system)]
+              }
+
+              deinit {
+                  llama_sampler_free(sampler)
+                  llama_free(ctx)
+              }
+
+              // MARK: Interfaccia
+
+              func streamResponse(to prompt: String) -> AsyncThrowingStream<String, Error> {
+                  AsyncThrowingStream { continuation in
+                      let flag = CancelFlag()
+                      continuation.onTermination = { _ in flag.cancel() }
+                      DispatchQueue.global(qos: .userInitiated).async { [self] in
+                          lock.lock()
+                          defer { lock.unlock() }
+                          do {
+                              try generate(prompt, flag: flag) { _ = continuation.yield($0) }
+                              continuation.finish()
+                          } catch {
+                              continuation.finish(throwing: error)
+                          }
+                      }
+                  }
+              }
+
+              // MARK: Generazione
+
+              private func generate(_ prompt: String, flag: CancelFlag, emit: (String) -> Void) throws {
+                  messages.append(("user", prompt))
+
+                  var tokens = buildTokens()
+                  while tokens.count > nCtx - 768 && messages.count > 2 {
+                      messages.remove(at: 1)
+                      if messages.count > 2, messages[1].role == "assistant" { messages.remove(at: 1) }
+                      tokens = buildTokens()
+                  }
+                  guard tokens.count < nCtx - 64 else { throw LlamaError.tooLong }
+
+                  let mem = llama_get_memory(ctx)
+
+                  // riusa la parte iniziale già elaborata
+                  var common = 0
+                  let limit = min(cached.count, tokens.count)
+                  while common < limit && cached[common] == tokens[common] { common += 1 }
+                  if common == tokens.count { common -= 1 }
+                  if common < 0 { common = 0 }
+                  if common < cached.count {
+                      let ok = llama_memory_seq_rm(mem, 0, Int32(common), -1)
+                      if ok {
+                          cached.removeSubrange(common...)
+                      } else {
+                          llama_memory_clear(mem, true)
+                          cached = []
+                          common = 0
+                      }
+                  }
+
+                  // elabora il testo nuovo a blocchi
+                  var i = common
+                  while i < tokens.count {
+                      if flag.isCancelled { return }
+                      let end = min(i + nBatch, tokens.count)
+                      var chunk = Array(tokens[i..<end])
+                      let rc: Int32 = chunk.withUnsafeMutableBufferPointer { buf in
+                          llama_decode(ctx, llama_batch_get_one(buf.baseAddress, Int32(buf.count)))
+                      }
+                      if rc != 0 {
+                          llama_memory_clear(mem, true)
+                          cached = []
+                          throw LlamaError.decode(rc)
+                      }
+                      cached.append(contentsOf: chunk)
+                      i = end
+                  }
+
+                  // genera la risposta
+                  var text = ""
+                  var pending = Data()
+                  let maxNew = min(4096, nCtx - tokens.count - 8)
+                  var produced = 0
+                  while produced < maxNew && cached.count < nCtx - 1 {
+                      if flag.isCancelled { break }
+                      var token = llama_sampler_sample(sampler, ctx, -1)
+                      if llama_vocab_is_eog(vocab, token) { break }
+
+                      pending.append(contentsOf: pieceBytes(token))
+                      if let s = String(data: pending, encoding: .utf8) {
+                          pending.removeAll()
+                          if !s.isEmpty { text += s; emit(s) }
+                      } else if pending.count > 8 {
+                          let s = String(decoding: pending, as: UTF8.self)
+                          pending.removeAll()
+                          text += s
+                          emit(s)
+                      }
+
+                      let rc: Int32 = withUnsafeMutablePointer(to: &token) { p in
+                          llama_decode(ctx, llama_batch_get_one(p, 1))
+                      }
+                      if rc != 0 {
+                          llama_memory_clear(mem, true)
+                          cached = []
+                          messages.append(("assistant", text))
+                          throw LlamaError.decode(rc)
+                      }
+                      cached.append(token)
+                      produced += 1
+
+                      if ToolParser.hasCompleteCall(text) { break }
+                  }
+                  messages.append(("assistant", text))
+              }
+
+              // MARK: Testo e token
+
+              private func buildTokens() -> [llama_token] {
+                  var formatted = formatPrompt()
+                  if disableThinking { formatted += "<think>\n\n</think>\n\n" }
+                  let hasBOS = formatted.hasPrefix("<bos>") || formatted.hasPrefix("<|begin_of_text|>")
+                      || formatted.hasPrefix("<s>") || formatted.hasPrefix("[gMASK]")
+                  return tokenize(formatted, addSpecial: !hasBOS)
+              }
+
+              private func formatPrompt() -> String {
+                  var owned: [UnsafeMutablePointer<CChar>?] = []
+                  var chat: [llama_chat_message] = []
+                  for m in messages {
+                      let r = strdup(m.role)
+                      let c = strdup(m.content)
+                      owned.append(r)
+                      owned.append(c)
+                      chat.append(llama_chat_message(role: r, content: c))
+                  }
+                  defer { owned.forEach { free($0) } }
+
+                  let total = messages.reduce(0) { $0 + $1.content.utf8.count }
+                  func apply(_ tmpl: String) -> String? {
+                      var buf = [CChar](repeating: 0, count: max(4096, total * 2 + 1024))
+                      var n = llama_chat_apply_template(tmpl, chat, chat.count, true, &buf, Int32(buf.count))
+                      if n > Int32(buf.count) {
+                          buf = [CChar](repeating: 0, count: Int(n) + 1)
+                          n = llama_chat_apply_template(tmpl, chat, chat.count, true, &buf, Int32(buf.count))
+                      }
+                      guard n > 0 else { return nil }
+                      let bytes = buf[0..<Int(n)].map { UInt8(bitPattern: $0) }
+                      return String(decoding: bytes, as: UTF8.self)
+                  }
+
+                  if let s = apply(template) { return s }
+                  if let s = apply("chatml") { return s }
+                  var out = ""
+                  for m in messages { out += "<|im_start|>\(m.role)\n\(m.content)<|im_end|>\n" }
+                  return out + "<|im_start|>assistant\n"
+              }
+
+              private func tokenize(_ text: String, addSpecial: Bool) -> [llama_token] {
+                  let count = text.utf8.count
+                  var tokens = [llama_token](repeating: 0, count: count + 16)
+                  var n = llama_tokenize(vocab, text, Int32(count), &tokens, Int32(tokens.count), addSpecial, true)
+                  if n < 0 {
+                      tokens = [llama_token](repeating: 0, count: Int(-n))
+                      n = llama_tokenize(vocab, text, Int32(count), &tokens, Int32(tokens.count), addSpecial, true)
+                  }
+                  return n > 0 ? Array(tokens[0..<Int(n)]) : []
+              }
+
+              private func pieceBytes(_ token: llama_token) -> [UInt8] {
+                  var buf = [CChar](repeating: 0, count: 64)
+                  var n = llama_token_to_piece(vocab, token, &buf, Int32(buf.count), 0, false)
+                  if n < 0 {
+                      buf = [CChar](repeating: 0, count: Int(-n))
+                      n = llama_token_to_piece(vocab, token, &buf, Int32(buf.count), 0, false)
+                  }
+                  guard n > 0 else { return [] }
+                  return buf[0..<Int(n)].map { UInt8(bitPattern: $0) }
+              }
+          }
+          SWIFTEOF
           cat > App/FilesView.swift << 'SWIFTEOF'
           import SwiftUI
 
@@ -1151,13 +1612,13 @@ jobs:
                   UserDefaults.standard.set(saved, forKey: key)
               }
 
-              func search(_ query: String) async {
+              func search(_ query: String, gguf: Bool = false) async {
                   let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !q.isEmpty else { results = []; return }
                   guard var comps = URLComponents(string: "https://huggingface.co/api/models") else { return }
                   comps.queryItems = [
                       URLQueryItem(name: "search", value: q),
-                      URLQueryItem(name: "filter", value: "mlx"),
+                      URLQueryItem(name: "filter", value: gguf ? "gguf" : "mlx"),
                       URLQueryItem(name: "pipeline_tag", value: "text-generation"),
                       URLQueryItem(name: "sort", value: "downloads"),
                       URLQueryItem(name: "direction", value: "-1"),
@@ -1174,6 +1635,35 @@ jobs:
                   }
                   isSearching = false
               }
+
+              /// Elenco dei file .gguf (le varie "taglie" di quantizzazione) di un repository.
+              func ggufFiles(repo: String) async throws -> [GGUFFile] {
+                  struct Entry: Decodable {
+                      struct LFS: Decodable { let size: Int64? }
+                      let type: String
+                      let path: String
+                      let size: Int64?
+                      let lfs: LFS?
+                  }
+                  guard let url = URL(string: "https://huggingface.co/api/models/\(repo)/tree/main?recursive=true") else { return [] }
+                  let (data, _) = try await URLSession.shared.data(from: url)
+                  let entries = try JSONDecoder().decode([Entry].self, from: data)
+                  return entries
+                      .filter {
+                          let lower = $0.path.lowercased()
+                          return $0.type == "file" && lower.hasSuffix(".gguf")
+                              && !lower.contains("mmproj") && !lower.contains("-of-")
+                      }
+                      .map { GGUFFile(name: $0.path, size: $0.lfs?.size ?? $0.size ?? 0) }
+                      .sorted { $0.size < $1.size }
+              }
+          }
+
+          struct GGUFFile: Identifiable, Hashable {
+              let name: String
+              let size: Int64
+              var id: String { name }
+              var sizeGB: Double { Double(size) / 1_073_741_824 }
           }
           SWIFTEOF
           cat > App/Models.swift << 'SWIFTEOF'
@@ -1218,7 +1708,70 @@ jobs:
                   Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
               }
 
+              static func displayName(_ id: String) -> String {
+                  if let ref = GGUFRef(id: id) {
+                      let name = (ref.file as NSString).lastPathComponent
+                      return name.lowercased().hasSuffix(".gguf") ? String(name.dropLast(5)) : name
+                  }
+                  return id.split(separator: "/").last.map(String.init) ?? id
+              }
+
+              static func subtitle(_ id: String) -> String {
+                  if let ref = GGUFRef(id: id) { return "GGUF · " + ref.repo }
+                  return id
+              }
+
+              /// Accetta un nome MLX (proprietario/repo), un link a un file .gguf o gguf:repo:file.
+              static func normalize(_ input: String) -> String? {
+                  var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if text.hasPrefix("gguf:") { return GGUFRef(id: text) != nil ? text : nil }
+                  if let q = text.firstIndex(of: "?") { text = String(text[..<q]) }
+                  if let r = text.range(of: "huggingface.co/") {
+                      let parts = text[r.upperBound...].split(separator: "/").map(String.init)
+                      if parts.count >= 5, parts[2] == "resolve" || parts[2] == "blob",
+                         parts.last?.lowercased().hasSuffix(".gguf") == true {
+                          return GGUFRef.makeID(repo: parts[0] + "/" + parts[1],
+                                                file: parts[4...].joined(separator: "/"))
+                      }
+                      if parts.count >= 2 { text = parts[0] + "/" + parts[1] }
+                  }
+                  let parts = text.split(separator: "/").map(String.init)
+                  if text.lowercased().hasSuffix(".gguf"), parts.count >= 3 {
+                      return GGUFRef.makeID(repo: parts[0] + "/" + parts[1],
+                                            file: parts[2...].joined(separator: "/"))
+                  }
+                  return parts.count == 2 ? text : nil
+              }
+
+              private static func ggufEstimate(_ ref: GGUFRef) -> Double? {
+                  let path = ref.localURL.path
+                  if let attr = try? FileManager.default.attributesOfItem(atPath: path),
+                     let size = attr[.size] as? Int64, size > 0 {
+                      return Double(size) / 1_073_741_824 * 1.1
+                  }
+                  let name = (ref.file as NSString).lastPathComponent
+                  let ns = name as NSString
+                  guard let re = try? NSRegularExpression(
+                      pattern: #"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)([BbMm])(?![A-Za-z])"#),
+                        let m = re.firstMatch(in: name, range: NSRange(location: 0, length: ns.length)),
+                        let number = Double(ns.substring(with: m.range(at: 1)))
+                  else { return nil }
+                  let billions = ns.substring(with: m.range(at: 2)).lowercased() == "b" ? number : number / 1000
+                  let lower = name.lowercased()
+                  var bits = 4.85
+                  if lower.contains("bf16") || lower.contains("f16") { bits = 16 }
+                  else if lower.contains("f32") { bits = 32 }
+                  else if let qre = try? NSRegularExpression(pattern: #"q(\d)"#),
+                          let qm = qre.firstMatch(in: lower, range: NSRange(location: 0, length: (lower as NSString).length)),
+                          let q = Int((lower as NSString).substring(with: qm.range(at: 1))) {
+                      let table: [Int: Double] = [2: 3.0, 3: 3.9, 4: 4.85, 5: 5.7, 6: 6.6, 8: 8.5]
+                      bits = table[q] ?? 4.85
+                  }
+                  return billions * bits / 8 * 1.1
+              }
+
               static func estimatedGB(_ id: String) -> Double? {
+                  if let ref = GGUFRef(id: id) { return ggufEstimate(ref) }
                   let name = id.split(separator: "/").last.map(String.init) ?? id
                   let ns = name as NSString
 
@@ -1264,9 +1817,9 @@ jobs:
                   let ram = String(format: "%.0f", deviceRAMGB)
                   switch weight(id) {
                   case .tooHeavy:
-                      return "Questo modello (\(size)) è troppo grande per un iPhone con \(ram) GB di memoria: molto probabilmente l'app si chiuderà da sola. Puoi provare lo stesso, ma è meglio scegliere un modello più piccolo."
+                      return "Questo modello (\(size)) potrebbe non funzionare su un iPhone con \(ram) GB di memoria."
                   case .heavy:
-                      return "Questo modello (\(size)) è pesante per un iPhone con \(ram) GB di memoria: potrebbe essere lento o chiudere l'app. Vuoi provarlo?"
+                      return "Questo modello (\(size)) potrebbe essere lento o non funzionare su un iPhone con \(ram) GB di memoria."
                   default:
                       return ""
                   }
@@ -1284,6 +1837,9 @@ jobs:
               @Environment(\.dismiss) private var dismiss
               @State private var query = ""
               @State private var manualID = ""
+              @State private var searchGGUF = false
+              @State private var pickRepo: HFModel?
+              @State private var manualMessage: String?
 
               var body: some View {
                   NavigationStack {
@@ -1301,26 +1857,42 @@ jobs:
                           }
 
                           Section {
-                              TextField("es. mlx-community/Qwen3-4B-4bit", text: $manualID)
+                              Picker("Formato", selection: $searchGGUF) {
+                                  Text("MLX").tag(false)
+                                  Text("GGUF").tag(true)
+                              }
+                              .pickerStyle(.segmented)
+                          } header: {
+                              Text("Cerca")
+                          } footer: {
+                              Text(searchGGUF
+                                   ? "GGUF è il formato più diffuso (Gemma, Qwen, Llama, Mistral, Phi e tanti altri). Cerca qui sopra, poi scegli la versione da scaricare: Q4_K_M è un buon compromesso."
+                                   : "MLX è il formato ottimizzato per i chip Apple.")
+                          }
+
+                          Section {
+                              TextField("nome modello o link Hugging Face", text: $manualID)
                                   .textInputAutocapitalization(.never)
                                   .autocorrectionDisabled()
-                              Button("Aggiungi e usa") {
-                                  let id = manualID.trimmingCharacters(in: .whitespacesAndNewlines)
-                                  guard id.contains("/") else { return }
-                                  library.add(id)
-                                  manualID = ""
-                                  onChoose(id)
+                              Button("Aggiungi e usa") { addManual() }
+                                  .disabled(manualID.trimmingCharacters(in: .whitespaces).isEmpty)
+                              if let msg = manualMessage {
+                                  Text(msg).font(.footnote).foregroundStyle(.orange)
                               }
-                              .disabled(!manualID.contains("/"))
+                              if let url = URL(string: "https://huggingface.co/models?library=gguf&sort=trending") {
+                                  Link(destination: url) {
+                                      Label("Sfoglia i modelli GGUF su Hugging Face", systemImage: "safari")
+                                  }
+                              }
                               if let url = URL(string: "https://huggingface.co/mlx-community") {
                                   Link(destination: url) {
-                                      Label("Sfoglia i modelli su Hugging Face", systemImage: "safari")
+                                      Label("Sfoglia i modelli MLX su Hugging Face", systemImage: "safari")
                                   }
                               }
                           } header: {
                               Text("Dove scaricarli")
                           } footer: {
-                              Text("I modelli si scaricano da Hugging Face. Copia il nome del modello (es. mlx-community/Qwen3-4B-4bit) e incollalo qui sopra. Servono modelli in formato MLX. Puoi usare qualsiasi modello: se è troppo grande per il tuo iPhone ti avviso prima.")
+                              Text("Incolla il nome del modello (es. mlx-community/Qwen3-4B-4bit), il link alla pagina di un modello GGUF oppure il link diretto a un file .gguf. Puoi usare qualsiasi modello: se è troppo grande per il tuo iPhone ti avviso, ma puoi provarlo lo stesso.")
                           }
 
                           if library.isSearching {
@@ -1333,15 +1905,20 @@ jobs:
                               Section("Risultati della ricerca") {
                                   ForEach(library.results) { model in
                                       Button {
-                                          library.add(model.id)
-                                          onChoose(model.id)
+                                          if searchGGUF {
+                                              pickRepo = model
+                                          } else {
+                                              library.add(model.id)
+                                              onChoose(model.id)
+                                          }
                                       } label: {
                                           VStack(alignment: .leading, spacing: 2) {
                                               HStack {
                                                   Text(model.id).font(.subheadline)
-                                                  weightIcon(model.id)
+                                                  if !searchGGUF { weightIcon(model.id) }
                                               }
-                                              Text("\(ModelInfo.sizeLabel(model.id))   ↓ \(model.downloads ?? 0)   ♥ \(model.likes ?? 0)")
+                                              Text((searchGGUF ? "" : ModelInfo.sizeLabel(model.id) + "   ")
+                                                   + "↓ \(model.downloads ?? 0)   ♥ \(model.likes ?? 0)")
                                                   .font(.caption).foregroundStyle(.secondary)
                                           }
                                       }
@@ -1354,7 +1931,19 @@ jobs:
                       .navigationBarTitleDisplayMode(.inline)
                       .searchable(text: $query, prompt: "Cerca su Hugging Face")
                       .onSubmit(of: .search) {
-                          Task { await library.search(query) }
+                          Task { await library.search(query, gguf: searchGGUF) }
+                      }
+                      .onChange(of: searchGGUF) { _, _ in
+                          if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                              Task { await library.search(query, gguf: searchGGUF) }
+                          }
+                      }
+                      .sheet(item: $pickRepo) { repo in
+                          GGUFPicker(library: library, repo: repo.id) { id in
+                              pickRepo = nil
+                              library.add(id)
+                              onChoose(id)
+                          }
                       }
                       .toolbar {
                           ToolbarItem(placement: .confirmationAction) {
@@ -1368,10 +1957,10 @@ jobs:
                   HStack {
                       VStack(alignment: .leading, spacing: 2) {
                           HStack(spacing: 6) {
-                              Text(id.split(separator: "/").last.map(String.init) ?? id)
+                              Text(ModelInfo.displayName(id))
                               weightIcon(id)
                           }
-                          Text("\(ModelInfo.sizeLabel(id))  \(id)")
+                          Text("\(ModelInfo.sizeLabel(id))  \(ModelInfo.subtitle(id))")
                               .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                       }
                       Spacer()
@@ -1379,6 +1968,24 @@ jobs:
                           Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                       }
                   }
+              }
+
+              private func addManual() {
+                  manualMessage = nil
+                  let raw = manualID.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard let id = ModelInfo.normalize(raw) else {
+                      manualMessage = "Non riconosco questo nome. Usa «proprietario/modello» oppure incolla il link di Hugging Face."
+                      return
+                  }
+                  // repository GGUF senza file: faccio scegliere la versione
+                  if GGUFRef(id: id) == nil, id.lowercased().contains("gguf") {
+                      pickRepo = HFModel(id: id, downloads: nil, likes: nil)
+                      manualID = ""
+                      return
+                  }
+                  library.add(id)
+                  manualID = ""
+                  onChoose(id)
               }
 
               @ViewBuilder
@@ -1390,6 +1997,72 @@ jobs:
                       Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
                   default:
                       EmptyView()
+                  }
+              }
+          }
+
+
+          /// Scelta della versione (quantizzazione) di un modello GGUF.
+          struct GGUFPicker: View {
+              @ObservedObject var library: ModelLibrary
+              let repo: String
+              var onPick: (String) -> Void
+              @Environment(\.dismiss) private var dismiss
+              @State private var files: [GGUFFile] = []
+              @State private var loading = true
+              @State private var error: String?
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          if loading {
+                              ProgressView()
+                          } else if let error {
+                              Text(error).foregroundStyle(.orange)
+                          } else if files.isEmpty {
+                              Text("Non ho trovato file .gguf in questo modello.").foregroundStyle(.secondary)
+                          } else {
+                              Section {
+                                  ForEach(files) { file in
+                                      let id = GGUFRef.makeID(repo: repo, file: file.name)
+                                      Button { onPick(id) } label: {
+                                          HStack {
+                                              VStack(alignment: .leading, spacing: 2) {
+                                                  Text(file.name).font(.subheadline)
+                                                  Text(String(format: "%.1f GB", file.sizeGB)
+                                                       + (file.name.contains("Q4_K_M") ? "  ·  consigliato" : ""))
+                                                      .font(.caption).foregroundStyle(.secondary)
+                                              }
+                                              Spacer()
+                                              switch ModelInfo.weight(id) {
+                                              case .heavy:
+                                                  Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                                              case .tooHeavy:
+                                                  Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                                              default:
+                                                  EmptyView()
+                                              }
+                                          }
+                                      }
+                                      .foregroundStyle(.primary)
+                                  }
+                              } header: {
+                                  Text(repo)
+                              } footer: {
+                                  Text("Più il numero dopo la Q è basso, più il file è piccolo e veloce, ma meno preciso. Il simbolo ⚠︎ indica che potrebbe non funzionare sul tuo iPhone.")
+                              }
+                          }
+                      }
+                      .navigationTitle("Scegli la versione")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .cancellationAction) { Button("Annulla") { dismiss() } }
+                      }
+                      .task {
+                          do { files = try await library.ggufFiles(repo: repo) }
+                          catch { self.error = "Non riesco a leggere l'elenco dei file: \(error.localizedDescription)" }
+                          loading = false
+                      }
                   }
               }
           }
