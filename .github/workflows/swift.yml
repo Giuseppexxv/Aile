@@ -1,0 +1,969 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Crea i file del progetto
+        run: |
+          mkdir -p App Support
+          cat > project.yml <<'EOF_FILE_0'
+          name: AgenteLocale
+          options:
+            bundleIdPrefix: com.giuseppe
+            deploymentTarget:
+              iOS: "17.0"
+          packages:
+            MLXSwiftLM:
+              url: https://github.com/ml-explore/mlx-swift-lm
+              exactVersion: 2.29.3
+          targets:
+            AgenteLocale:
+              type: application
+              platform: iOS
+              sources:
+                - App
+              dependencies:
+                - package: MLXSwiftLM
+                  product: MLXLLM
+                - package: MLXSwiftLM
+                  product: MLXLMCommon
+              info:
+                path: Support/Info.plist
+                properties:
+                  CFBundleDisplayName: Agente Locale
+                  UILaunchScreen: {}
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.giuseppe.agentelocale
+                  PRODUCT_NAME: AgenteLocale
+                  SWIFT_VERSION: "5.0"
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1"
+          EOF_FILE_0
+          cat > App/AgentViewModel.swift <<'EOF_FILE_1'
+          import SwiftUI
+          import MLXLLM
+          import MLXLMCommon
+
+          struct ChatItem: Identifiable {
+              enum Role { case user, assistant, tool }
+              let id = UUID()
+              let role: Role
+              var text: String
+              var toolName: String? = nil
+              var ok: Bool = true
+          }
+
+          @MainActor
+          final class AgentViewModel: ObservableObject {
+              @Published var items: [ChatItem] = []
+              @Published var currentModelID: String?
+              @Published var status = "Nessun modello caricato"
+              @Published var downloadProgress = 0.0
+              @Published var isLoading = false
+              @Published var isReady = false
+              @Published var isGenerating = false
+
+              private var container: ModelContainer?
+              private var session: ChatSession?
+              private var task: Task<Void, Never>?
+              private let maxSteps = 10
+
+              var shortModelName: String {
+                  currentModelID?.split(separator: "/").last.map(String.init) ?? "nessun modello"
+              }
+
+              private func makeSession(_ c: ModelContainer) -> ChatSession {
+                  ChatSession(c, instructions: ToolParser.systemPrompt)
+              }
+
+              func loadModel(_ id: String) async {
+                  guard !isLoading, !isGenerating else { return }
+                  isLoading = true
+                  isReady = false
+                  downloadProgress = 0
+                  session = nil
+                  container = nil
+                  items = []
+                  currentModelID = id
+                  status = "Scarico \(shortModelName)…"
+
+                  do {
+                      let configuration = ModelConfiguration(id: id)
+                      let loaded = try await LLMModelFactory.shared.loadContainer(
+                          configuration: configuration
+                      ) { progress in
+                          Task { @MainActor in
+                              self.downloadProgress = progress.fractionCompleted
+                          }
+                      }
+                      container = loaded
+                      session = makeSession(loaded)
+                      isReady = true
+                      status = "Pronto · tutto in locale"
+                  } catch {
+                      status = "Errore: \(error.localizedDescription)"
+                  }
+                  isLoading = false
+              }
+
+              func send(_ text: String) {
+                  guard let session, !isGenerating else { return }
+                  items.append(ChatItem(role: .user, text: text))
+                  isGenerating = true
+                  task = Task {
+                      await runAgent(session: session, firstPrompt: text)
+                      isGenerating = false
+                  }
+              }
+
+              private func runAgent(session: ChatSession, firstPrompt: String) async {
+                  var prompt = firstPrompt
+                  for _ in 0..<maxSteps {
+                      if Task.isCancelled { return }
+                      items.append(ChatItem(role: .assistant, text: ""))
+                      let index = items.count - 1
+                      var full = ""
+                      do {
+                          for try await chunk in session.streamResponse(to: prompt) {
+                              full += chunk
+                              items[index].text = ToolParser.visibleText(full)
+                              // appena il modello chiude una chiamata, ci fermiamo: il risultato lo diamo noi
+                              if full.contains("</tool_call>") { break }
+                          }
+                      } catch {
+                          if !Task.isCancelled {
+                              items[index].text += "\n[Errore: \(error.localizedDescription)]"
+                          }
+                          return
+                      }
+                      if Task.isCancelled { return }
+
+                      let calls = ToolParser.parse(full)
+                      if items[index].text.isEmpty { items.remove(at: index) }
+                      if calls.isEmpty { return }
+
+                      var results: [String] = []
+                      for call in calls {
+                          let (ok, output) = Workspace.run(call)
+                          items.append(ChatItem(role: .tool, text: call.summary, toolName: call.name, ok: ok))
+                          results.append("[\(call.name)] \(ok ? "ok" : "error"): \(output)")
+                      }
+                      prompt = "<tool_response>\n" + results.joined(separator: "\n\n") + "\n</tool_response>"
+                  }
+                  items.append(ChatItem(role: .assistant, text: "Mi fermo: ho raggiunto il limite di passaggi per un singolo ordine."))
+              }
+
+              func stop() {
+                  task?.cancel()
+              }
+
+              func reset() {
+                  stop()
+                  items = []
+                  if let container { session = makeSession(container) }
+              }
+          }
+          EOF_FILE_1
+          cat > App/AgenteLocaleApp.swift <<'EOF_FILE_2'
+          import SwiftUI
+
+          @main
+          struct AgenteLocaleApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                          .preferredColorScheme(.dark)
+                  }
+              }
+          }
+          EOF_FILE_2
+          cat > App/ContentView.swift <<'EOF_FILE_3'
+          import SwiftUI
+
+          struct ContentView: View {
+              @StateObject private var agent = AgentViewModel()
+              @StateObject private var library = ModelLibrary()
+              @State private var input = ""
+              @State private var showModels = false
+              @State private var showFiles = false
+
+              private var canSend: Bool {
+                  agent.isReady && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      ZStack {
+                          Backdrop()
+                          chat
+                      }
+                      .navigationTitle("Agente")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .topBarLeading) {
+                              Button { showFiles = true } label: { Image(systemName: "folder") }
+                          }
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button { showModels = true } label: { Image(systemName: "cpu") }
+                          }
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button { agent.reset() } label: { Image(systemName: "arrow.counterclockwise") }
+                                  .disabled(agent.items.isEmpty || agent.isLoading)
+                          }
+                      }
+                      .safeAreaInset(edge: .bottom) { inputBar }
+                      .sheet(isPresented: $showModels) {
+                          ModelsView(library: library, agent: agent)
+                      }
+                      .sheet(isPresented: $showFiles) {
+                          FilesView()
+                      }
+                  }
+              }
+
+              // MARK: Chat
+
+              private var chat: some View {
+                  ScrollViewReader { proxy in
+                      ScrollView {
+                          VStack(spacing: 12) {
+                              statusChip
+                              if agent.items.isEmpty {
+                                  emptyState
+                              } else {
+                                  ForEach(agent.items) { item in
+                                      row(item).id(item.id)
+                                  }
+                              }
+                          }
+                          .padding()
+                      }
+                      .onChange(of: agent.items.last?.text) { _, _ in
+                          if let last = agent.items.last {
+                              proxy.scrollTo(last.id, anchor: .bottom)
+                          }
+                      }
+                      .onChange(of: agent.items.count) { _, _ in
+                          if let last = agent.items.last {
+                              proxy.scrollTo(last.id, anchor: .bottom)
+                          }
+                      }
+                  }
+              }
+
+              private var statusChip: some View {
+                  VStack(spacing: 6) {
+                      HStack(spacing: 8) {
+                          Image(systemName: agent.isReady ? "checkmark.circle.fill" : "cpu")
+                              .foregroundStyle(agent.isReady ? .green : .secondary)
+                          Text(agent.shortModelName).font(.subheadline.weight(.semibold))
+                          Text("·").foregroundStyle(.secondary)
+                          Text(agent.status).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                      }
+                      if agent.isLoading {
+                          ProgressView(value: agent.downloadProgress)
+                      }
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 10)
+                  .glass(cornerRadius: 18)
+              }
+
+              private var emptyState: some View {
+                  VStack(spacing: 14) {
+                      Image(systemName: "sparkles")
+                          .font(.system(size: 44))
+                          .foregroundStyle(.white.opacity(0.9))
+                      Text("Il tuo agente, sul tuo iPhone")
+                          .font(.title3.weight(.semibold))
+                      Text(agent.isReady
+                           ? "Dagli un ordine, per esempio: «Crea un file todo.txt con tre cose da fare»."
+                           : "Scegli un modello da Hugging Face e caricalo per cominciare.")
+                          .font(.subheadline)
+                          .foregroundStyle(.secondary)
+                          .multilineTextAlignment(.center)
+                      if !agent.isReady {
+                          Button { showModels = true } label: {
+                              Label("Scegli un modello", systemImage: "cpu")
+                                  .padding(.horizontal, 8)
+                          }
+                          .modifier(GlassButton(prominent: true))
+                      }
+                  }
+                  .padding(24)
+                  .frame(maxWidth: .infinity)
+                  .padding(.top, 40)
+              }
+
+              @ViewBuilder
+              private func row(_ item: ChatItem) -> some View {
+                  switch item.role {
+                  case .user:
+                      HStack {
+                          Spacer(minLength: 48)
+                          Text(item.text)
+                              .textSelection(.enabled)
+                              .padding(.horizontal, 14).padding(.vertical, 10)
+                              .glass(cornerRadius: 20, tint: .blue)
+                      }
+                  case .assistant:
+                      HStack {
+                          Text(markdown(item.text.isEmpty ? "…" : item.text))
+                              .textSelection(.enabled)
+                              .padding(.horizontal, 14).padding(.vertical, 10)
+                              .glass(cornerRadius: 20)
+                          Spacer(minLength: 48)
+                      }
+                  case .tool:
+                      HStack(spacing: 8) {
+                          Image(systemName: item.ok ? "doc.badge.gearshape" : "exclamationmark.triangle.fill")
+                              .foregroundStyle(item.ok ? Color.teal : Color.orange)
+                          Text(item.text)
+                              .font(.system(.footnote, design: .monospaced))
+                              .lineLimit(2)
+                          Spacer(minLength: 0)
+                      }
+                      .padding(.horizontal, 12).padding(.vertical, 8)
+                      .glass(cornerRadius: 14, tint: item.ok ? .teal : .orange)
+                  }
+              }
+
+              private func markdown(_ s: String) -> AttributedString {
+                  let options = AttributedString.MarkdownParsingOptions(
+                      interpretedSyntax: .inlineOnlyPreservingWhitespace)
+                  return (try? AttributedString(markdown: s, options: options)) ?? AttributedString(s)
+              }
+
+              // MARK: Input
+
+              private var inputBar: some View {
+                  HStack(alignment: .bottom, spacing: 10) {
+                      TextField("Dai un ordine all'agente…", text: $input, axis: .vertical)
+                          .lineLimit(1...5)
+                          .padding(.horizontal, 16).padding(.vertical, 12)
+                          .glass(cornerRadius: 24, interactive: true)
+
+                      if agent.isGenerating {
+                          Button { agent.stop() } label: {
+                              Image(systemName: "stop.fill").frame(width: 28, height: 28)
+                          }
+                          .modifier(GlassButton(prominent: true))
+                          .buttonBorderShape(.circle)
+                      } else {
+                          Button {
+                              let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                              guard !text.isEmpty else { return }
+                              input = ""
+                              agent.send(text)
+                          } label: {
+                              Image(systemName: "arrow.up").frame(width: 28, height: 28)
+                          }
+                          .modifier(GlassButton(prominent: true))
+                          .buttonBorderShape(.circle)
+                          .disabled(!canSend)
+                      }
+                  }
+                  .padding(.horizontal)
+                  .padding(.vertical, 8)
+              }
+          }
+          EOF_FILE_3
+          cat > App/FilesView.swift <<'EOF_FILE_4'
+          import SwiftUI
+
+          struct FilesView: View {
+              @Environment(\.dismiss) private var dismiss
+              @State private var files: [URL] = []
+
+              var body: some View {
+                  NavigationStack {
+                      Group {
+                          if files.isEmpty {
+                              ContentUnavailableView(
+                                  "Workspace vuoto",
+                                  systemImage: "folder",
+                                  description: Text("I file creati dall'agente compaiono qui e nell'app File, sotto Su iPhone > Agente Locale.")
+                              )
+                          } else {
+                              List {
+                                  ForEach(files, id: \.self) { url in
+                                      NavigationLink(Workspace.relativePath(url)) {
+                                          FileViewer(url: url)
+                                      }
+                                  }
+                                  .onDelete { offsets in
+                                      for i in offsets { try? FileManager.default.removeItem(at: files[i]) }
+                                      files = Workspace.allFiles()
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Workspace")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Fine") { dismiss() }
+                          }
+                      }
+                      .onAppear { files = Workspace.allFiles() }
+                  }
+              }
+          }
+
+          struct FileViewer: View {
+              let url: URL
+              @State private var text = ""
+
+              var body: some View {
+                  ScrollView {
+                      Text(text)
+                          .font(.system(.footnote, design: .monospaced))
+                          .textSelection(.enabled)
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .padding()
+                  }
+                  .navigationTitle(url.lastPathComponent)
+                  .navigationBarTitleDisplayMode(.inline)
+                  .toolbar {
+                      ToolbarItem(placement: .topBarTrailing) {
+                          ShareLink(item: url)
+                      }
+                  }
+                  .onAppear {
+                      text = (try? String(contentsOf: url, encoding: .utf8)) ?? "(file non leggibile come testo)"
+                  }
+              }
+          }
+          EOF_FILE_4
+          cat > App/Glass.swift <<'EOF_FILE_5'
+          import SwiftUI
+
+          @available(iOS 26.0, *)
+          private func makeGlass(tint: Color?, interactive: Bool) -> Glass {
+              var g = Glass.regular
+              if let tint { g = g.tint(tint) }
+              if interactive { g = g.interactive() }
+              return g
+          }
+
+          extension View {
+              /// Liquid Glass su iOS 26, materiale sfocato su versioni precedenti.
+              @ViewBuilder
+              func glass(cornerRadius: CGFloat = 20, tint: Color? = nil, interactive: Bool = false) -> some View {
+                  if #available(iOS 26.0, *) {
+                      self.glassEffect(makeGlass(tint: tint, interactive: interactive),
+                                       in: .rect(cornerRadius: cornerRadius))
+                  } else {
+                      self.background {
+                          ZStack {
+                              RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                                  .fill(.ultraThinMaterial)
+                              if let tint {
+                                  RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                                      .fill(tint.opacity(0.35))
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct GlassButton: ViewModifier {
+              var prominent = false
+
+              func body(content: Content) -> some View {
+                  if #available(iOS 26.0, *) {
+                      if prominent {
+                          content.buttonStyle(.glassProminent)
+                      } else {
+                          content.buttonStyle(.glass)
+                      }
+                  } else {
+                      if prominent {
+                          content.buttonStyle(.borderedProminent)
+                      } else {
+                          content.buttonStyle(.bordered)
+                      }
+                  }
+              }
+          }
+
+          /// Sfondo colorato dietro al vetro, così l'effetto si nota.
+          struct Backdrop: View {
+              var body: some View {
+                  ZStack {
+                      Color(red: 0.04, green: 0.05, blue: 0.09)
+                      Circle().fill(Color.blue.opacity(0.55))
+                          .frame(width: 320, height: 320)
+                          .blur(radius: 90)
+                          .offset(x: -130, y: -260)
+                      Circle().fill(Color.purple.opacity(0.50))
+                          .frame(width: 300, height: 300)
+                          .blur(radius: 90)
+                          .offset(x: 150, y: 40)
+                      Circle().fill(Color.teal.opacity(0.40))
+                          .frame(width: 280, height: 280)
+                          .blur(radius: 90)
+                          .offset(x: -90, y: 330)
+                  }
+                  .ignoresSafeArea()
+              }
+          }
+          EOF_FILE_5
+          cat > App/ModelLibrary.swift <<'EOF_FILE_6'
+          import Foundation
+
+          struct HFModel: Identifiable, Decodable, Hashable {
+              let id: String
+              let downloads: Int?
+              let likes: Int?
+          }
+
+          /// Elenco dei modelli scelti dall'utente + ricerca su Hugging Face.
+          @MainActor
+          final class ModelLibrary: ObservableObject {
+              static let defaults = [
+                  "mlx-community/Qwen2.5-3B-Instruct-4bit",
+                  "mlx-community/Qwen3-4B-4bit",
+                  "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                  "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+              ]
+              private let key = "savedModels"
+
+              @Published var saved: [String]
+              @Published var results: [HFModel] = []
+              @Published var isSearching = false
+              @Published var searchError: String?
+
+              init() {
+                  saved = UserDefaults.standard.stringArray(forKey: key) ?? ModelLibrary.defaults
+              }
+
+              func add(_ id: String) {
+                  let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard clean.contains("/"), !saved.contains(clean) else { return }
+                  saved.append(clean)
+                  persist()
+              }
+
+              func remove(at offsets: IndexSet) {
+                  saved.remove(atOffsets: offsets)
+                  persist()
+              }
+
+              private func persist() {
+                  UserDefaults.standard.set(saved, forKey: key)
+              }
+
+              func search(_ query: String) async {
+                  let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !q.isEmpty else { results = []; return }
+                  guard var comps = URLComponents(string: "https://huggingface.co/api/models") else { return }
+                  comps.queryItems = [
+                      URLQueryItem(name: "search", value: q),
+                      URLQueryItem(name: "filter", value: "mlx"),
+                      URLQueryItem(name: "pipeline_tag", value: "text-generation"),
+                      URLQueryItem(name: "sort", value: "downloads"),
+                      URLQueryItem(name: "direction", value: "-1"),
+                      URLQueryItem(name: "limit", value: "25")
+                  ]
+                  guard let url = comps.url else { return }
+                  isSearching = true
+                  searchError = nil
+                  do {
+                      let (data, _) = try await URLSession.shared.data(from: url)
+                      results = try JSONDecoder().decode([HFModel].self, from: data)
+                  } catch {
+                      searchError = "Ricerca non riuscita: \(error.localizedDescription)"
+                  }
+                  isSearching = false
+              }
+          }
+          EOF_FILE_6
+          cat > App/ModelsView.swift <<'EOF_FILE_7'
+          import SwiftUI
+
+          struct ModelsView: View {
+              @ObservedObject var library: ModelLibrary
+              @ObservedObject var agent: AgentViewModel
+              @Environment(\.dismiss) private var dismiss
+              @State private var query = ""
+              @State private var manualID = ""
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section("I tuoi modelli") {
+                              ForEach(library.saved, id: \.self) { id in
+                                  Button { choose(id) } label: {
+                                      HStack {
+                                          VStack(alignment: .leading, spacing: 2) {
+                                              Text(short(id)).font(.body)
+                                              Text(id).font(.caption).foregroundStyle(.secondary)
+                                          }
+                                          Spacer()
+                                          if agent.currentModelID == id && agent.isReady {
+                                              Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                                          }
+                                      }
+                                  }
+                                  .foregroundStyle(.primary)
+                              }
+                              .onDelete(perform: library.remove)
+                          }
+
+                          Section {
+                              TextField("es. mlx-community/Qwen3-4B-4bit", text: $manualID)
+                                  .textInputAutocapitalization(.never)
+                                  .autocorrectionDisabled()
+                              Button("Aggiungi e usa") {
+                                  let id = manualID.trimmingCharacters(in: .whitespacesAndNewlines)
+                                  guard id.contains("/") else { return }
+                                  library.add(id)
+                                  manualID = ""
+                                  choose(id)
+                              }
+                              .disabled(!manualID.contains("/"))
+                          } header: {
+                              Text("Incolla un modello da Hugging Face")
+                          } footer: {
+                              Text("Servono modelli in formato MLX (di solito sotto mlx-community). Più grande è il modello, più RAM serve: sotto i 4 miliardi di parametri a 4 bit è la zona sicura.")
+                          }
+
+                          if library.isSearching {
+                              Section { ProgressView() }
+                          }
+                          if let err = library.searchError {
+                              Section { Text(err).foregroundStyle(.orange) }
+                          }
+                          if !library.results.isEmpty {
+                              Section("Risultati") {
+                                  ForEach(library.results) { model in
+                                      Button {
+                                          library.add(model.id)
+                                          choose(model.id)
+                                      } label: {
+                                          VStack(alignment: .leading, spacing: 2) {
+                                              Text(model.id).font(.subheadline)
+                                              Text("↓ \(model.downloads ?? 0)   ♥ \(model.likes ?? 0)")
+                                                  .font(.caption).foregroundStyle(.secondary)
+                                          }
+                                      }
+                                      .foregroundStyle(.primary)
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Modelli")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .searchable(text: $query, prompt: "Cerca su Hugging Face (MLX)")
+                      .onSubmit(of: .search) {
+                          Task { await library.search(query) }
+                      }
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Fine") { dismiss() }
+                          }
+                      }
+                  }
+              }
+
+              private func short(_ id: String) -> String {
+                  id.split(separator: "/").last.map(String.init) ?? id
+              }
+
+              private func choose(_ id: String) {
+                  guard !agent.isGenerating, !agent.isLoading else { return }
+                  dismiss()
+                  Task { await agent.loadModel(id) }
+              }
+          }
+          EOF_FILE_7
+          cat > App/Workspace.swift <<'EOF_FILE_8'
+          import Foundation
+
+          struct ToolCall {
+              let name: String
+              let args: [String: Any]
+
+              var summary: String {
+                  let path = (args["path"] as? String) ?? ""
+                  return path.isEmpty ? name : "\(name)  \(path)"
+              }
+          }
+
+          /// Cartella sandbox dove l'agente può lavorare.
+          /// È visibile anche nell'app File (Su iPhone > Agente Locale > Workspace).
+          enum Workspace {
+              static let root: URL = {
+                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                  let url = docs.appendingPathComponent("Workspace", isDirectory: true)
+                  try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                  return url
+              }()
+
+              struct WSError: LocalizedError {
+                  let message: String
+                  var errorDescription: String? { message }
+              }
+
+              static func resolve(_ path: String) throws -> URL {
+                  let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let rel = cleaned.hasPrefix("/") ? String(cleaned.dropFirst()) : cleaned
+                  let url = (rel.isEmpty || rel == ".") ? root : root.appendingPathComponent(rel)
+                  let std = url.standardizedFileURL
+                  let rootPath = root.standardizedFileURL.path
+                  guard std.path == rootPath || std.path.hasPrefix(rootPath + "/") else {
+                      throw WSError(message: "Percorso fuori dal workspace: \(path)")
+                  }
+                  return std
+              }
+
+              static func relativePath(_ url: URL) -> String {
+                  let rootPath = root.standardizedFileURL.path
+                  let p = url.standardizedFileURL.path
+                  guard p.hasPrefix(rootPath + "/") else { return url.lastPathComponent }
+                  return String(p.dropFirst(rootPath.count + 1))
+              }
+
+              static func allFiles() -> [URL] {
+                  guard let en = FileManager.default.enumerator(
+                      at: root,
+                      includingPropertiesForKeys: [.isDirectoryKey],
+                      options: [.skipsHiddenFiles]
+                  ) else { return [] }
+                  var result: [URL] = []
+                  for case let url as URL in en {
+                      let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                      if !isDir { result.append(url) }
+                  }
+                  return result.sorted { $0.path < $1.path }
+              }
+
+              static func run(_ call: ToolCall) -> (ok: Bool, output: String) {
+                  func str(_ key: String) -> String? {
+                      if let s = call.args[key] as? String { return s }
+                      if let n = call.args[key] as? NSNumber { return n.stringValue }
+                      return nil
+                  }
+                  let fm = FileManager.default
+                  do {
+                      switch call.name {
+                      case "list_files":
+                          let url = try resolve(str("path") ?? ".")
+                          let items = try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey])
+                              .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                          if items.isEmpty { return (true, "(cartella vuota)") }
+                          let lines = items.map { item -> String in
+                              let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                              return item.lastPathComponent + (isDir ? "/" : "")
+                          }
+                          return (true, lines.joined(separator: "\n"))
+
+                      case "read_file":
+                          guard let path = str("path") else { throw WSError(message: "manca 'path'") }
+                          let url = try resolve(path)
+                          guard fm.fileExists(atPath: url.path) else { throw WSError(message: "file non trovato: \(path)") }
+                          let text = try String(contentsOf: url, encoding: .utf8)
+                          if text.count > 8000 {
+                              return (true, String(text.prefix(8000)) + "\n…[troncato, \(text.count) caratteri totali]")
+                          }
+                          return (true, text.isEmpty ? "(file vuoto)" : text)
+
+                      case "write_file":
+                          guard let path = str("path") else { throw WSError(message: "manca 'path'") }
+                          let content = str("content") ?? ""
+                          let url = try resolve(path)
+                          try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                          try content.write(to: url, atomically: true, encoding: .utf8)
+                          return (true, "scritto \(path) (\(content.count) caratteri)")
+
+                      case "append_file":
+                          guard let path = str("path") else { throw WSError(message: "manca 'path'") }
+                          let content = str("content") ?? ""
+                          let url = try resolve(path)
+                          try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                          let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                          try (existing + content).write(to: url, atomically: true, encoding: .utf8)
+                          return (true, "aggiunto testo a \(path)")
+
+                      case "replace_in_file":
+                          guard let path = str("path"), let old = str("old") else {
+                              throw WSError(message: "servono 'path' e 'old'")
+                          }
+                          let new = str("new") ?? ""
+                          let url = try resolve(path)
+                          guard fm.fileExists(atPath: url.path) else { throw WSError(message: "file non trovato: \(path)") }
+                          var text = try String(contentsOf: url, encoding: .utf8)
+                          guard let range = text.range(of: old) else {
+                              throw WSError(message: "testo da sostituire non trovato in \(path)")
+                          }
+                          text.replaceSubrange(range, with: new)
+                          try text.write(to: url, atomically: true, encoding: .utf8)
+                          return (true, "modificato \(path)")
+
+                      case "make_dir":
+                          guard let path = str("path") else { throw WSError(message: "manca 'path'") }
+                          try fm.createDirectory(at: try resolve(path), withIntermediateDirectories: true)
+                          return (true, "cartella creata: \(path)")
+
+                      case "delete_file":
+                          guard let path = str("path") else { throw WSError(message: "manca 'path'") }
+                          let url = try resolve(path)
+                          guard url.path != root.standardizedFileURL.path else {
+                              throw WSError(message: "non puoi cancellare la radice")
+                          }
+                          guard fm.fileExists(atPath: url.path) else { throw WSError(message: "non trovato: \(path)") }
+                          try fm.removeItem(at: url)
+                          return (true, "eliminato \(path)")
+
+                      default:
+                          return (false, "tool sconosciuto: \(call.name)")
+                      }
+                  } catch {
+                      return (false, error.localizedDescription)
+                  }
+              }
+          }
+
+          /// Estrae le chiamate ai tool dal testo generato dal modello.
+          enum ToolParser {
+              static let systemPrompt = #"""
+              You are a local on-device agent running on an iPhone. You help the user by working with files in a private workspace folder.
+
+              To use a tool, output EXACTLY this format and then stop writing:
+              <tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>
+              You will then receive the result inside <tool_response> and can continue. Call one tool at a time.
+              When the task is finished, answer normally WITHOUT any tool call, briefly, in the user's language.
+
+              Tools:
+              - list_files {"path": "."} : list a folder
+              - read_file {"path": "notes.txt"} : read a text file
+              - write_file {"path": "dir/file.txt", "content": "..."} : create or overwrite a file
+              - append_file {"path": "file.txt", "content": "..."} : add text at the end of a file
+              - replace_in_file {"path": "file.txt", "old": "exact old text", "new": "new text"} : replace the first occurrence
+              - make_dir {"path": "dir"} : create a folder
+              - delete_file {"path": "file.txt"} : delete a file or folder
+
+              Rules: paths are relative to the workspace. Always read a file before editing it. Never invent the content of files you have not read. Use valid JSON (escape newlines as \n inside strings).
+              """#
+
+              static func visibleText(_ s: String) -> String {
+                  var text = s
+                  // Rimuove i blocchi di ragionamento <think>...</think>
+                  if let re = try? NSRegularExpression(pattern: #"<think>[\s\S]*?</think>"#) {
+                      text = re.stringByReplacingMatches(
+                          in: text, range: NSRange(location: 0, length: (text as NSString).length), withTemplate: "")
+                  }
+                  if let r = text.range(of: "<think>") { text = String(text[..<r.lowerBound]) }
+                  if let r = text.range(of: "<tool_call>") { text = String(text[..<r.lowerBound]) }
+                  return text.trimmingCharacters(in: .whitespacesAndNewlines)
+              }
+
+              static func parse(_ text: String) -> [ToolCall] {
+                  var jsons: [String] = []
+                  let pattern = #"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#
+                  if let re = try? NSRegularExpression(pattern: pattern) {
+                      let ns = text as NSString
+                      for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+                          jsons.append(ns.substring(with: m.range(at: 1)))
+                      }
+                  }
+                  if jsons.isEmpty, let r = text.range(of: "<tool_call>") {
+                      let tail = String(text[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                      if tail.hasPrefix("{"), let end = tail.lastIndex(of: "}") {
+                          jsons.append(String(tail[...end]))
+                      }
+                  }
+                  return jsons.compactMap(decode)
+              }
+
+              private static func decode(_ json: String) -> ToolCall? {
+                  for candidate in [json, sanitize(json)] {
+                      guard let data = candidate.data(using: .utf8),
+                            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                            let name = obj["name"] as? String else { continue }
+                      let args = (obj["arguments"] as? [String: Any]) ?? (obj["parameters"] as? [String: Any]) ?? [:]
+                      return ToolCall(name: name, args: args)
+                  }
+                  return nil
+              }
+
+              /// Corregge a-capo e tab "veri" dentro le stringhe JSON, errore frequente nei modelli piccoli.
+              private static func sanitize(_ json: String) -> String {
+                  var out = ""
+                  var inString = false
+                  var escaped = false
+                  for ch in json {
+                      if inString {
+                          if escaped { out.append(ch); escaped = false; continue }
+                          switch ch {
+                          case "\\": out.append(ch); escaped = true
+                          case "\"": out.append(ch); inString = false
+                          case "\n": out += "\\n"
+                          case "\r": break
+                          case "\t": out += "\\t"
+                          default: out.append(ch)
+                          }
+                      } else {
+                          if ch == "\"" { inString = true }
+                          out.append(ch)
+                      }
+                  }
+                  return out
+              }
+          }
+          EOF_FILE_8
+
+      - name: Installa XcodeGen
+        run: brew install xcodegen
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Versione Xcode
+        run: xcodebuild -version
+
+      - name: Genera il progetto Xcode
+        run: xcodegen generate
+
+      - name: Compila (senza firma)
+        run: |
+          xcodebuild \
+            -project AgenteLocale.xcodeproj \
+            -scheme AgenteLocale \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Crea l'IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/AgenteLocale.app Payload/
+          zip -qr AgenteLocale.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgenteLocale-ipa
+          path: AgenteLocale.ipa
