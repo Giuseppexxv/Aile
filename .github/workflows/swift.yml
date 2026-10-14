@@ -161,6 +161,8 @@ jobs:
                   container = nil
                   llamaModel = nil
                   currentModelID = id
+                  UIApplication.shared.isIdleTimerDisabled = true
+                  defer { UIApplication.shared.isIdleTimerDisabled = false }
 
                   do {
                       if let ref = GGUFRef(id: id) {
@@ -181,7 +183,11 @@ jobs:
                       isReady = session != nil
                       if isReady { UserDefaults.standard.set(id, forKey: "lastModel") }
                   } catch {
-                      loadError = "Non sono riuscito ad aprire questo modello: potrebbe non essere supportato dall'app. (\(error.localizedDescription))"
+                      if error is LlamaError {
+                          loadError = error.localizedDescription
+                      } else {
+                          loadError = "Non sono riuscito ad aprire questo modello: potrebbe non essere supportato dall'app. (\(error.localizedDescription))"
+                      }
                   }
                   isLoading = false
               }
@@ -193,7 +199,13 @@ jobs:
                       let downloader = GGUFDownloader(destination: local) { [weak self] value in
                           Task { @MainActor in self?.downloadProgress = value }
                       }
-                      try await downloader.download(from: remote)
+                      do {
+                          try await downloader.download(from: remote)
+                      } catch let e as LlamaError {
+                          throw e
+                      } catch {
+                          throw LlamaError.download(error.localizedDescription)
+                      }
                   }
                   downloadProgress = 1
                   let path = local.path
@@ -1052,6 +1064,7 @@ jobs:
               case context
               case decode(Int32)
               case tooLong
+              case download(String)
 
               var errorDescription: String? {
                   switch self {
@@ -1060,6 +1073,7 @@ jobs:
                   case .load: return "Non riesco ad aprire il file del modello."
                   case .context: return "Non riesco a preparare la memoria di lavoro del modello."
                   case .decode(let code): return "Il modello si è fermato (codice \(code))."
+                  case .download(let why): return "Il download non è riuscito (\(why)). Riprova: tieni l'app aperta e lo schermo acceso finché non finisce."
                   case .tooLong: return "La conversazione è troppo lunga per questo modello. Apri una nuova chat."
                   }
               }
@@ -1083,7 +1097,11 @@ jobs:
                       try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
                           lock.lock()
                           continuation = c
-                          let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                          let config = URLSessionConfiguration.default
+                          config.timeoutIntervalForRequest = 900
+                          config.timeoutIntervalForResource = 60 * 60 * 24
+                          config.waitsForConnectivity = true
+                          let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
                           session = s
                           let t = s.downloadTask(with: url)
                           task = t
