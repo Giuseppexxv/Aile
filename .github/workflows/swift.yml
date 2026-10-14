@@ -90,6 +90,7 @@ jobs:
               @Published var currentModelID: String?
               @Published var loadError: String?
               @Published var downloadProgress = 0.0
+              @Published var downloadDetail = ""
               @Published var isLoading = false
               @Published var isReady = false
               @Published var isGenerating = false
@@ -102,6 +103,8 @@ jobs:
               private var container: ModelContainer?
               private var session: LLMSession?
               private var llamaModel: LlamaModel?
+              private var forceCPU = false
+              private var wasBackgrounded = false
               private var task: Task<Void, Never>?
               private var continuation: CheckedContinuation<String, Never>?
               private var threadID = UUID()
@@ -111,6 +114,11 @@ jobs:
 
               init() {
                   Workspace.root = store.currentFolder
+                  NotificationCenter.default.addObserver(
+                      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+                  ) { [weak self] _ in
+                      Task { @MainActor in self?.wasBackgrounded = true }
+                  }
               }
 
               // MARK: Impostazioni lette al volo
@@ -157,9 +165,11 @@ jobs:
                   isReady = false
                   loadError = nil
                   downloadProgress = 0
+                  downloadDetail = ""
                   session = nil
                   container = nil
                   llamaModel = nil
+                  if currentModelID != id { forceCPU = false }
                   currentModelID = id
                   UIApplication.shared.isIdleTimerDisabled = true
                   defer { UIApplication.shared.isIdleTimerDisabled = false }
@@ -194,10 +204,19 @@ jobs:
 
               private func loadGGUF(_ ref: GGUFRef) async throws {
                   let local = ref.localURL
+                  if FileManager.default.fileExists(atPath: local.path), !ref.localFileIsValid() {
+                      // un file rovinato o finto: lo tolgo e lo riscarico
+                      try? FileManager.default.removeItem(at: local)
+                  }
                   if !FileManager.default.fileExists(atPath: local.path) {
                       guard let remote = ref.remoteURL else { throw LlamaError.badURL }
-                      let downloader = GGUFDownloader(destination: local) { [weak self] value in
-                          Task { @MainActor in self?.downloadProgress = value }
+                      let downloader = GGUFDownloader(destination: local) { [weak self] value, got, total in
+                          Task { @MainActor in
+                              self?.downloadProgress = value
+                              self?.downloadDetail = String(format: "%.2f di %.2f GB",
+                                                            Double(got) / 1_073_741_824,
+                                                            Double(total) / 1_073_741_824)
+                          }
                       }
                       do {
                           try await downloader.download(from: remote)
@@ -208,9 +227,11 @@ jobs:
                       }
                   }
                   downloadProgress = 1
+                  downloadDetail = ""
                   let path = local.path
+                  let useGPU = !forceCPU && ((UserDefaults.standard.object(forKey: "useGPU") as? Bool) ?? true)
                   llamaModel = try await Task.detached(priority: .userInitiated) {
-                      try LlamaModel(path: path)
+                      try LlamaModel(path: path, gpu: useGPU)
                   }.value
               }
 
@@ -386,6 +407,7 @@ jobs:
                   }
 
                   lastHTML = nil
+                  wasBackgrounded = false
                   runToken = UUID()
                   let token = runToken
                   isGenerating = true
@@ -419,7 +441,24 @@ jobs:
                           }
                       } catch {
                           if !Task.isCancelled {
-                              items[index].text += "\n[Errore: \(error.localizedDescription)]"
+                              if case LlamaError.decode(let code) = error, code < -1, let m = llamaModel {
+                                  if wasBackgrounded {
+                                      items[index].text += "\n[La risposta si è interrotta perché hai lasciato l'app. Riscrivi l'ordine restando nell'app.]"
+                                  } else if m.gpu {
+                                      items[index].text += "\n[La scheda grafica del telefono non regge questo modello. Passo al processore: è più lento ma più stabile. Aspetta qualche secondo e riscrivi l'ordine.]"
+                                      forceCPU = true
+                                      if let id = currentModelID {
+                                          Task {
+                                              try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                              await self.loadModel(id)
+                                          }
+                                      }
+                                  } else {
+                                      items[index].text += "\n[Errore: \(error.localizedDescription)]"
+                                  }
+                              } else {
+                                  items[index].text += "\n[Errore: \(error.localizedDescription)]"
+                              }
                           }
                           return
                       }
@@ -775,6 +814,9 @@ jobs:
                   VStack(spacing: 6) {
                       Text("Preparo \(agent.shortModelName)…").font(.subheadline.weight(.semibold))
                       ProgressView(value: agent.downloadProgress)
+                      if !agent.downloadDetail.isEmpty {
+                          Text(agent.downloadDetail).font(.footnote.monospacedDigit())
+                      }
                       Text("La prima volta il modello va scaricato: serve il Wi-Fi.")
                           .font(.footnote).foregroundStyle(.secondary)
                   }
@@ -1049,6 +1091,17 @@ jobs:
                       .appendingPathComponent(file)
               }
 
+              /// Il file esiste, è abbastanza grande e inizia con la sigla «GGUF».
+              func localFileIsValid() -> Bool {
+                  let path = localURL.path
+                  guard let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64),
+                        size > 1_000_000,
+                        let h = FileHandle(forReadingAtPath: path) else { return false }
+                  defer { try? h.close() }
+                  let magic = (try? h.read(upToCount: 4)) ?? Data()
+                  return magic == Data("GGUF".utf8)
+              }
+
               var remoteURL: URL? {
                   let encoded = file.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file
                   return URL(string: "https://huggingface.co/\(repo)/resolve/main/\(encoded)")
@@ -1065,45 +1118,102 @@ jobs:
               case decode(Int32)
               case tooLong
               case download(String)
+              case invalidFile(Int64)
 
               var errorDescription: String? {
                   switch self {
                   case .badURL: return "Indirizzo del modello non valido."
                   case .http(let code): return "Il download è stato rifiutato (errore \(code)). Il modello potrebbe richiedere un accesso su Hugging Face."
-                  case .load: return "Non riesco ad aprire il file del modello."
+                  case .load: return "Non riesco ad aprire il modello: il file è scaricato, ma questo tipo di modello potrebbe non essere supportato dal motore dell'app."
                   case .context: return "Non riesco a preparare la memoria di lavoro del modello."
                   case .decode(let code): return "Il modello si è fermato (codice \(code))."
                   case .download(let why): return "Il download non è riuscito (\(why)). Riprova: tieni l'app aperta e lo schermo acceso finché non finisce."
+                  case .invalidFile(let size): return "Il file scaricato non è un modello valido (pesa solo \(String(format: "%.1f", Double(size) / 1_048_576)) MB). L'ho cancellato: riprova a scaricarlo."
                   case .tooLong: return "La conversazione è troppo lunga per questo modello. Apri una nuova chat."
                   }
               }
           }
 
-          final class GGUFDownloader: NSObject, URLSessionDownloadDelegate {
+          /// Download robusto: scrive su un file parziale, riprende da dove si è fermato
+          /// e riprova da solo se la connessione cade.
+          final class GGUFDownloader: NSObject, URLSessionDataDelegate {
               private let destination: URL
-              private let onProgress: (Double) -> Void
+              private let partURL: URL
+              private let onProgress: (Double, Int64, Int64) -> Void
               private let lock = NSLock()
               private var continuation: CheckedContinuation<Void, Error>?
               private var session: URLSession?
-              private var task: URLSessionDownloadTask?
+              private var task: URLSessionDataTask?
+              private var handle: FileHandle?
+              private var offset: Int64 = 0
+              private var total: Int64 = 0
+              private var failure: Error?
 
-              init(destination: URL, onProgress: @escaping (Double) -> Void) {
+              init(destination: URL, onProgress: @escaping (Double, Int64, Int64) -> Void) {
                   self.destination = destination
+                  self.partURL = destination.appendingPathExtension("part")
                   self.onProgress = onProgress
               }
 
               func download(from url: URL) async throws {
+                  let fm = FileManager.default
+                  try fm.createDirectory(at: destination.deletingLastPathComponent(),
+                                         withIntermediateDirectories: true)
+                  var attempt = 0
+                  while true {
+                      try Task.checkCancellation()
+                      do {
+                          try await runOnce(url)
+                          break
+                      } catch {
+                          if error is CancellationError || (error as? URLError)?.code == .cancelled { throw error }
+                          if let e = error as? LlamaError, case .http = e { throw e }
+                          attempt += 1
+                          if attempt > 40 { throw error }
+                          try await Task.sleep(nanoseconds: UInt64(min(attempt, 5)) * 2_000_000_000)
+                      }
+                  }
+                  // controllo che sia davvero un modello e che sia completo
+                  let size = (try? fm.attributesOfItem(atPath: partURL.path)[.size] as? Int64) ?? 0
+                  var magic = Data()
+                  if let h = FileHandle(forReadingAtPath: partURL.path) {
+                      magic = (try? h.read(upToCount: 4)) ?? Data()
+                      try? h.close()
+                  }
+                  if size < 1_000_000 || magic != Data("GGUF".utf8) || (total > 0 && size < total) {
+                      try? fm.removeItem(at: partURL)
+                      throw LlamaError.invalidFile(size)
+                  }
+                  if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+                  try fm.moveItem(at: partURL, to: destination)
+              }
+
+              private func runOnce(_ url: URL) async throws {
+                  let fm = FileManager.default
+                  let existing = (try? fm.attributesOfItem(atPath: partURL.path)[.size] as? Int64) ?? 0
+                  offset = existing
+                  total = 0
+                  failure = nil
+
+                  var request = URLRequest(url: url)
+                  request.timeoutInterval = 120
+                  if offset > 0 { request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range") }
+
                   try await withTaskCancellationHandler {
                       try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
                           lock.lock()
                           continuation = c
                           let config = URLSessionConfiguration.default
-                          config.timeoutIntervalForRequest = 900
+                          config.timeoutIntervalForRequest = 120
                           config.timeoutIntervalForResource = 60 * 60 * 24
                           config.waitsForConnectivity = true
+                          let cellular = (UserDefaults.standard.object(forKey: "allowCellular") as? Bool) ?? true
+                          config.allowsCellularAccess = cellular
+                          config.allowsExpensiveNetworkAccess = cellular
+                          config.allowsConstrainedNetworkAccess = cellular
                           let s = URLSession(configuration: config, delegate: self, delegateQueue: nil)
                           session = s
-                          let t = s.downloadTask(with: url)
+                          let t = s.dataTask(with: request)
                           task = t
                           lock.unlock()
                           t.resume()
@@ -1121,39 +1231,87 @@ jobs:
                   let c = continuation
                   continuation = nil
                   let s = session
+                  session = nil
                   lock.unlock()
-                  s?.finishTasksAndInvalidate()
+                  try? handle?.close()
+                  handle = nil
+                  s?.invalidateAndCancel()
                   guard let c else { return }
                   if let error { c.resume(throwing: error) } else { c.resume() }
               }
 
-              func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                              didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
-                              totalBytesExpectedToWrite: Int64) {
-                  guard totalBytesExpectedToWrite > 0 else { return }
-                  onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+              func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                              didReceive response: URLResponse,
+                              completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+                  guard let http = response as? HTTPURLResponse else {
+                      completionHandler(.cancel)
+                      finish(URLError(.badServerResponse))
+                      return
+                  }
+                  let fm = FileManager.default
+                  switch http.statusCode {
+                  case 200, 206:
+                      do {
+                          if !fm.fileExists(atPath: partURL.path) {
+                              fm.createFile(atPath: partURL.path, contents: nil)
+                          }
+                          let h = try FileHandle(forWritingTo: partURL)
+                          if http.statusCode == 200 {
+                              // il server ha ignorato la ripresa: si riparte da zero
+                              try h.truncate(atOffset: 0)
+                              offset = 0
+                              total = http.expectedContentLength > 0 ? http.expectedContentLength : 0
+                          } else {
+                              try h.seekToEnd()
+                              if let range = http.value(forHTTPHeaderField: "Content-Range"),
+                                 let slash = range.lastIndex(of: "/"),
+                                 let t = Int64(range[range.index(after: slash)...]) {
+                                  total = t
+                              } else if http.expectedContentLength > 0 {
+                                  total = offset + http.expectedContentLength
+                              }
+                          }
+                          handle = h
+                          completionHandler(.allow)
+                      } catch {
+                          completionHandler(.cancel)
+                          finish(error)
+                      }
+                  case 416:
+                      // file parziale non valido o già completo
+                      completionHandler(.cancel)
+                      if offset > 0, let range = http.value(forHTTPHeaderField: "Content-Range"),
+                         range.hasSuffix("/\(offset)") {
+                          finish(nil)
+                      } else {
+                          try? fm.removeItem(at: partURL)
+                          finish(URLError(.networkConnectionLost))
+                      }
+                  default:
+                      completionHandler(.cancel)
+                      finish(LlamaError.http(http.statusCode))
+                  }
               }
 
-              func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                              didFinishDownloadingTo location: URL) {
+              func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
                   do {
-                      if let http = downloadTask.response as? HTTPURLResponse,
-                         !(200..<300).contains(http.statusCode) {
-                          throw LlamaError.http(http.statusCode)
-                      }
-                      let fm = FileManager.default
-                      try fm.createDirectory(at: destination.deletingLastPathComponent(),
-                                             withIntermediateDirectories: true)
-                      if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
-                      try fm.moveItem(at: location, to: destination)
-                      finish(nil)
+                      try handle?.write(contentsOf: data)
+                      offset += Int64(data.count)
+                      if total > 0 { onProgress(Double(offset) / Double(total), offset, total) }
                   } catch {
+                      dataTask.cancel()
                       finish(error)
                   }
               }
 
               func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-                  if let error { finish(error) }
+                  if let error {
+                      finish(error)
+                  } else if total > 0 && offset < total {
+                      finish(URLError(.networkConnectionLost))
+                  } else {
+                      finish(nil)
+                  }
               }
           }
 
@@ -1162,15 +1320,17 @@ jobs:
           final class LlamaModel: @unchecked Sendable {
               let model: OpaquePointer
               let fileName: String
+              let gpu: Bool
               private static var backendReady = false
 
-              init(path: String) throws {
+              init(path: String, gpu: Bool = true) throws {
+                  self.gpu = gpu
                   if !LlamaModel.backendReady {
                       llama_backend_init()
                       LlamaModel.backendReady = true
                   }
                   var params = llama_model_default_params()
-                  params.n_gpu_layers = 999
+                  params.n_gpu_layers = gpu ? 999 : 0
                   guard let loaded = (llama_model_load_from_file(path, params) as OpaquePointer?) else {
                       throw LlamaError.load
                   }
@@ -1208,7 +1368,7 @@ jobs:
                   llamaModel = model
 
                   let ram = ProcessInfo.processInfo.physicalMemory
-                  var wanted = ram >= 7_500_000_000 ? 8192 : 4096
+                  var wanted = ram >= 11_000_000_000 ? 8192 : 4096
                   let trained = Int(llama_model_n_ctx_train(model.model))
                   if trained > 0 { wanted = min(wanted, trained) }
                   let ctxSize = max(1024, wanted)
@@ -1261,21 +1421,40 @@ jobs:
                       DispatchQueue.global(qos: .userInitiated).async { [self] in
                           lock.lock()
                           defer { lock.unlock() }
-                          do {
-                              try generate(prompt, flag: flag) { _ = continuation.yield($0) }
-                              continuation.finish()
-                          } catch {
-                              continuation.finish(throwing: error)
+                          messages.append(("user", prompt))
+                          var attempt = 0
+                          var emitted = false
+                          while true {
+                              do {
+                                  try generate(flag: flag) { text in
+                                      emitted = true
+                                      _ = continuation.yield(text)
+                                  }
+                                  continuation.finish()
+                                  return
+                              } catch LlamaError.decode(let code) where code == -3 && attempt < 2 && !emitted && !flag.isCancelled {
+                                  // la GPU a volte si rifiuta per un attimo: pulisco e riprovo
+                                  attempt += 1
+                                  if messages.last?.role == "assistant" { messages.removeLast() }
+                                  resetCache()
+                                  Thread.sleep(forTimeInterval: 1.5)
+                              } catch {
+                                  continuation.finish(throwing: error)
+                                  return
+                              }
                           }
                       }
                   }
               }
 
+              private func resetCache() {
+                  llama_memory_clear(llama_get_memory(ctx), true)
+                  cached = []
+              }
+
               // MARK: Generazione
 
-              private func generate(_ prompt: String, flag: CancelFlag, emit: (String) -> Void) throws {
-                  messages.append(("user", prompt))
-
+              private func generate(flag: CancelFlag, emit: (String) -> Void) throws {
                   var tokens = buildTokens()
                   while tokens.count > nCtx - 768 && messages.count > 2 {
                       messages.remove(at: 1)
@@ -1421,6 +1600,39 @@ jobs:
                   }
                   guard n > 0 else { return [] }
                   return buf[0..<Int(n)].map { UInt8(bitPattern: $0) }
+              }
+          }
+
+
+          // MARK: - Modelli scaricati
+
+          struct DownloadedFile: Identifiable {
+              let url: URL
+              let size: Int64
+              var id: String { url.path }
+              var name: String { url.lastPathComponent }
+              var isPartial: Bool { url.pathExtension == "part" }
+              var sizeText: String {
+                  size >= 1_073_741_824
+                      ? String(format: "%.2f GB", Double(size) / 1_073_741_824)
+                      : String(format: "%.0f MB", Double(size) / 1_048_576)
+              }
+          }
+
+          enum DownloadedModels {
+              static func list() -> [DownloadedFile] {
+                  let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                      .appendingPathComponent("Models", isDirectory: true)
+                  guard let walker = FileManager.default.enumerator(
+                      at: base, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { return [] }
+                  var result: [DownloadedFile] = []
+                  for case let url as URL in walker {
+                      let ext = url.pathExtension.lowercased()
+                      guard ext == "gguf" || ext == "part" else { continue }
+                      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                      result.append(DownloadedFile(url: url, size: Int64(size)))
+                  }
+                  return result.sorted { $0.name < $1.name }
               }
           }
           SWIFTEOF
@@ -2299,6 +2511,9 @@ jobs:
               @AppStorage("maxSteps") private var maxSteps = 12
               @AppStorage("confirmDelete") private var confirmDelete = true
               @State private var confirmClear = false
+              @AppStorage("allowCellular") private var allowCellular = true
+              @AppStorage("useGPU") private var useGPU = true
+              @State private var downloaded: [DownloadedFile] = []
 
               var body: some View {
                   NavigationStack {
@@ -2313,6 +2528,49 @@ jobs:
 
                           Section {
                               Toggle("Chiedi prima di eliminare file", isOn: $confirmDelete)
+                          }
+
+                          Section {
+                              Toggle("Scarica anche con i dati cellulari", isOn: $allowCellular)
+                          } header: {
+                              Text("Download dei modelli")
+                          } footer: {
+                              Text("Vale per i modelli GGUF. I modelli sono grandi (da 1 a 5 GB): con i dati cellulari consumi molto traffico.")
+                          }
+
+                          Section {
+                              Toggle("Usa la scheda grafica (GPU)", isOn: $useGPU)
+                          } header: {
+                              Text("Modelli GGUF")
+                          } footer: {
+                              Text("È più veloce. Se un modello dà l'errore «codice -3», spegnila e ricarica il modello: userà il processore, più lento ma più stabile. Vale dal prossimo caricamento.")
+                          }
+
+                          Section {
+                              if downloaded.isEmpty {
+                                  Text("Nessun modello GGUF scaricato.").foregroundStyle(.secondary)
+                              }
+                              ForEach(downloaded) { file in
+                                  HStack {
+                                      VStack(alignment: .leading, spacing: 2) {
+                                          Text(file.name).font(.subheadline).lineLimit(2)
+                                          Text(file.sizeText + (file.isPartial ? "  ·  download incompleto" : ""))
+                                              .font(.caption).foregroundStyle(file.isPartial ? .orange : .secondary)
+                                      }
+                                      Spacer()
+                                      Button(role: .destructive) {
+                                          try? FileManager.default.removeItem(at: file.url)
+                                          downloaded = DownloadedModels.list()
+                                      } label: {
+                                          Image(systemName: "trash")
+                                      }
+                                      .buttonStyle(.borderless)
+                                  }
+                              }
+                          } header: {
+                              Text("Modelli scaricati")
+                          } footer: {
+                              Text("Qui vedi quanto pesa davvero ogni file. Se un modello non si avvia, eliminalo da qui e riscaricalo.")
                           }
 
                           Section("Il tuo iPhone") {
@@ -2334,6 +2592,7 @@ jobs:
                       }
                       .navigationTitle("Impostazioni")
                       .navigationBarTitleDisplayMode(.inline)
+                      .onAppear { downloaded = DownloadedModels.list() }
                       .toolbar {
                           ToolbarItem(placement: .confirmationAction) {
                               Button("Fine") { dismiss() }
